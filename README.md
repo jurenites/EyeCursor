@@ -1,10 +1,16 @@
 # EyeCursor
 
-EyeCursor is our native macOS gaze-cursor application, built on top of the
-open-source [EyeTracker library by JEOresearch](https://github.com/JEOresearch/EyeTracker).
-It combines a glasses-mounted IR camera with the laptop webcam for head-aware
-calibration and a smooth eye-cursor. It also provides an IR-only mode, menu-bar
-controls, and local recording/replay tools. See [setup and usage](3DTracker/readme.md#native-macos-calibration).
+EyeCursor is a native macOS app for tracking pupils and mapping eye movements to
+a gaze cursor on screen. This project is my fork of the open-source
+[EyeTracker library by JEOresearch](https://github.com/JEOresearch/EyeTracker),
+which I am developing into a Mac app for my own eye-tracking setup.
+
+The app uses IR eye cameras for pupil detection and supports a laptop webcam for
+head-aware screen calibration. It includes independent left and right eye
+detection, an IR-only mode, menu-bar controls, live diagnostics, and local
+recording and replay tools. Screen calibration currently uses one selected eye.
+
+See [setup and usage](3DTracker/readme.md#native-macos-calibration) to get started.
 
 Native USB mode now has independent left/right camera assignments in
 **Diagnostics → Camera setup**. The left eye defaults to a 180° rotation; the
@@ -16,8 +22,14 @@ previews sit close together above the camera and tracking controls; no tracking
 tabs are needed. Identical camera models have numbered picker options and full
 USB identifiers in tooltips. An open picker is not rebuilt by status polling.
 
-The existing screen calibration and 3D view still use the previously configured
-calibration eye (left by default), identified below Camera setup. This is dual-eye
+The existing screen calibration still uses the previously configured
+calibration eye (left by default), identified below Camera setup. The 3D view adds
+independent magenta (left IR) and orange (right IR) rays and small screen-plane
+intersection markers. Their X/Y readouts are percentages from the laptop screen’s
+top-left and may fall outside 0–100%. These approximate directions require a
+valid eye-model estimate and head pose paired to that camera’s capture time.
+Missing or stale measurements hide that ray. The single green EyeCursor estimate
+and its calibration remain unchanged. This is dual-eye
 detection, not a binocular screen calibration: the two camera rays are not
 averaged. Changing that camera or its rotation resets its calibration; changing
 the other camera resets only its detector. Disconnecting either eye does not

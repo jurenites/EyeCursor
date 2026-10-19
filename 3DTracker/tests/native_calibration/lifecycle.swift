@@ -142,7 +142,10 @@ precondition(firstVideo < secondVideo)
 precondition(!arrangedCameras[(firstVideo+1)..<secondVideo].contains { $0 is NSButton || $0 is NSSlider || $0 is NSStackView },
              "Eye previews must be adjacent apart from their headings and status readouts")
 precondition(arrangedCameras.firstIndex(of: controller.previewAlignButton)! > secondVideo)
-precondition(arrangedCameras.firstIndex(of: controller.thresholdLabel)! > secondVideo)
+precondition(controller.thresholdLabel.superview === controller.eyeSetupStack)
+precondition(controller.thresholdSlider.superview?.superview === controller.eyeSetupStack,
+             "The threshold label, slider and value must collapse with Camera setup")
+precondition(controller.thresholdValue.superview === controller.thresholdSlider.superview)
 precondition(!arrangedCameras.contains { $0 is NSSegmentedControl }, "Both eyes track without tabs")
 precondition(arrangedCameras.firstIndex(of: controller.eyeSetupToggle)! > arrangedCameras.firstIndex(of: controller.facePreview)!,
              "All camera controls must follow all video feeds")
@@ -220,14 +223,14 @@ let laptopScreen = NSScreen.screens.first { candidate in
     return CGDisplayIsBuiltin(number.uint32Value) != 0
 } ?? screen
 let id = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as! NSNumber).stringValue
-func state(_ phase: String, valid: Bool = true, headPitch: Double = 0, cursor: Bool = false, tracked: Bool = true, irEye: Bool = false, circleStart: Double? = nil, fixedTarget: [Double]? = nil, savedTarget: [Double]? = nil, rawGaze: [Double]? = nil, references: Bool = false, webcamRays: [[Double]] = [[0,0,-1],[0,0,-1]], referenceCount: Int = 1, referenceSession: String = "test", referenceShift: Double = 0, geometric: Bool = false, accuracy: [String:Any]? = nil, eyeSide: String? = nil, calibrationProgress: Double = 0.9, accepted: Bool = true, targetIndex: Int = 2, calibrationTarget: [Double]? = nil, cursorProgress: Double = 0.4) -> TrackerState {
+func state(_ phase: String, valid: Bool = true, headPitch: Double = 0, cursor: Bool = false, tracked: Bool = true, irEye: Bool = false, circleStart: Double? = nil, fixedTarget: [Double]? = nil, savedTarget: [Double]? = nil, rawGaze: [Double]? = nil, references: Bool = false, webcamRays: [[Double]] = [[0,0,-1],[0,0,-1]], referenceCount: Int = 1, referenceSession: String = "test", referenceShift: Double = 0, geometric: Bool = false, accuracy: [String:Any]? = nil, eyeSide: String? = nil, calibrationProgress: Double = 0.9, accepted: Bool = true, targetIndex: Int = 2, calibrationTarget: [Double]? = nil, cursorProgress: Double = 0.4, irSlots: [String: Any] = [:]) -> TrackerState {
     let complete = phase == "complete"
     let captured: [[String:Any]] = references ? (0..<referenceCount).map { i in
         var head = neutralHead; head[3] += referenceShift + Double(i)*0.0001
         return ["id":i+1,"eye":[0.5,0.4],"head":head,"target":[0.8,0.2],"source":"cursor","predicted_before":[0.6,0.4]]
     } : []
     let payload: [String: Any] = [
-        "eye_cameras": eyeSide != nil ? ["active_eye":eyeSide!,"eyes":[:],"devices":[]] as Any : NSNull(),
+        "eye_cameras": eyeSide != nil ? ["active_eye":eyeSide!,"eyes":irSlots,"devices":[]] as Any : NSNull(),
         "source": "test", "camera_connected": true, "valid": valid, "display_valid": valid && complete,
         "calibrated": complete, "desktop_cursor": complete,
         "desktop_gaze": complete && valid ? [laptopScreen.frame.midX, screen.frame.maxY - laptopScreen.frame.midY] as Any : NSNull(),
@@ -297,6 +300,64 @@ webcamPreview.rebuild(at: 12)
 precondition(webcamPreview.geometry.childNode(withName: "webcam-screen-hit-0", recursively: true)!.simdPosition != initialWebcamHits[0])
 precondition(webcamPreview.geometry.childNode(withName: "webcam-screen-hit-1", recursively: true)!.simdPosition == initialWebcamHits[1],
              "Changing one iris must leave the other eye prediction unchanged")
+// Independent USB rays must never converge on the cursor merely because it exists.
+func irSlot(_ side: String, _ vector: [Double]?, connected: Bool = true, epoch: String = "0:1") -> [String: Any] {
+    ["device_id":side+"-usb", "rotation":side == "left" ? 180 : 0, "connected":connected,
+     "fps":30.0, "status":"Connected", "tracking_epoch":epoch,
+     "scene_direction":vector.map { ["vector":$0,"head_features":neutralHead] } as Any? ?? NSNull()]
+}
+let irScene = AngleDebugger()
+let irSlots = ["left":irSlot("left", [0.12,0.04,1]), "right":irSlot("right", [-0.22,-0.06,1])]
+func irState(_ slots: [String:Any]) -> TrackerState {
+    state("complete", irEye:true, rawGaze:[0.6,0.4], webcamRays:[], eyeSide:"right", irSlots:slots)
+}
+irScene.update(irState(irSlots), at:20); irScene.rebuild(at:20)
+func irNode(_ name: String) -> SCNNode? { irScene.geometry.childNode(withName:name, recursively:true) }
+let initialIRHits = ["left","right"].map { irNode("ir-camera-hit-"+$0)!.simdPosition }
+let cursorHit = irNode("calibrated-screen-gaze")!.simdPosition
+let cursorRay = irNode("live-gaze-ray")!.simdTransform
+precondition(simd_distance(initialIRHits[0], initialIRHits[1]) > 1)
+precondition(abs(irNode("ir-camera-origin-right")!.simdPosition.x-irNode("ir-camera-origin-left")!.simdPosition.x-irScene.eyeSeparation()) < 0.001)
+for (side, vector) in [("left",SIMD3<Float>(-0.12,0.04,-1)),("right",SIMD3<Float>(0.22,-0.06,-1))] {
+    let measured = irNode("ir-camera-ray-"+side)!.simdOrientation.act(SIMD3<Float>(0,1,0))
+    precondition(simd_distance(measured,AngleGeometry.unit(vector)) < 0.0001,
+                 "Each USB camera direction must be transformed into the screen frame independently")
+}
+precondition(irScene.cameraRayMetrics.stringValue.contains("Left IR:") && irScene.cameraRayMetrics.stringValue.contains("Right IR:"))
+irScene.sliders["tx"]!.doubleValue = 90; irScene.sliders["ty"]!.doubleValue = 10
+irScene.rebuild(at:20.1)
+precondition(irNode("ir-camera-hit-left")!.simdPosition == initialIRHits[0] && irNode("ir-camera-hit-right")!.simdPosition == initialIRHits[1],
+             "Moving the target must not steer either camera ray")
+irScene.update(irState(["left":irSlot("left", [0.7,0.05,1]),"right":irSlots["right"]!]), at:21)
+irScene.rebuild(at:21)
+precondition(irNode("ir-camera-hit-left")!.simdPosition != initialIRHits[0])
+precondition(irNode("ir-camera-hit-right")!.simdPosition == initialIRHits[1])
+precondition(irScene.cameraRayMetrics.stringValue.contains("outside"), "Do not clamp off-screen measurements")
+precondition(irNode("calibrated-screen-gaze")!.simdPosition == cursorHit && irNode("live-gaze-ray")!.simdTransform == cursorRay,
+             "Per-eye visualization must preserve the existing single cursor estimate")
+precondition(irScene.geometry.childNodes.filter { $0.name == "calibrated-screen-gaze" }.count == 1)
+irScene.update(irState(["left":irSlot("left", nil, connected:false),"right":irSlots["right"]!]), at:22)
+irScene.rebuild(at:22)
+precondition(irNode("ir-camera-ray-left") == nil && irNode("ir-camera-hit-left") == nil)
+precondition(irNode("ir-camera-ray-right") != nil)
+precondition(irScene.cameraRayMetrics.stringValue.contains("Left IR: unavailable"))
+irScene.update(irState(["left":irSlot("left", [0,0,-1], epoch:"0:2"),"right":irSlots["right"]!]), at:22.1)
+irScene.rebuild(at:22.1)
+precondition(irNode("ir-camera-ray-left") != nil && irNode("ir-camera-hit-left") == nil,
+             "Backward rays must not invent a screen intersection, including after a reconnect")
+irScene.rebuild(at:23)
+precondition(irNode("ir-camera-ray-left") == nil && irNode("ir-camera-ray-right") == nil,
+             "Both rays must expire if state polling stops")
+irScene.update(irState(irSlots), at:24); irScene.rebuild(at:24)
+if let path = ProcessInfo.processInfo.environment["EYECURSOR_BINOCULAR_SNAPSHOT"] {
+    irScene.sceneView.frame = NSRect(x:0,y:0,width:1000,height:750)
+    irScene.sceneView.isPlaying = false
+    let picture = irScene.sceneView.snapshot()
+    let bitmap = NSBitmapImageRep(data:picture.tiffRepresentation!)!
+    try! bitmap.representation(using:.png,properties:[:])!.write(to:URL(fileURLWithPath:path))
+}
+irScene.invalidate(); irScene.rebuild(at:24.1)
+precondition(irNode("ir-camera-ray-left") == nil && irNode("ir-camera-ray-right") == nil)
 // Hold the rendered pose, including a partially smoothed movement, through
 // lost detections, expired measurements, and a failed tracker poll.
 let heldPreview = AngleDebugger()

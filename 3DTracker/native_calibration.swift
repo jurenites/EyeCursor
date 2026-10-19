@@ -42,6 +42,10 @@ struct EyeCameraDevice: Decodable {
     let id: String
     let name: String
 }
+struct EyeCameraDirection: Decodable {
+    let vector: [Double]
+    let head_features: [Double]
+}
 struct EyeCameraSlot: Decodable {
     let device_id: String?
     let rotation: Int
@@ -52,6 +56,8 @@ struct EyeCameraSlot: Decodable {
     var tracking: String? = nil
     var tracking_fps: Double? = nil
     var confidence: Double? = nil
+    var scene_direction: EyeCameraDirection? = nil
+    var tracking_epoch: String? = nil
 }
 struct EyeCamerasState: Decodable {
     let active_eye: String
@@ -1223,15 +1229,8 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
         eyeSetupStatus.font = .systemFont(ofSize: 11)
         eyeSetupStatus.textColor = .secondaryLabelColor
         addSetup(eyeSetupStatus, height: 64)
-        calibrationEyeStatus.font = .systemFont(ofSize: 11)
-        calibrationEyeStatus.textColor = .secondaryLabelColor
-        add(calibrationEyeStatus, height: 44)
-        // Reserve status space so live text never shifts the webcam below it.
-        title("Tracking controls")
-        add(diagnosticText, height: 20)
-        if hybrid { previewAlignButton.bezelStyle = .rounded; add(previewAlignButton, height: 28) }
         thresholdLabel.textColor = .secondaryLabelColor
-        add(thresholdLabel)
+        addSetup(thresholdLabel, height: 18)
         let thresholdSpace = NSView()
         let thresholdRow = NSStackView(views: [thresholdSlider, thresholdValue, thresholdSpace])
         thresholdRow.orientation = .horizontal; thresholdRow.spacing = 8
@@ -1243,7 +1242,14 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
         thresholdValue.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
         thresholdValue.textColor = .secondaryLabelColor
         thresholdValue.setContentHuggingPriority(.required, for: .horizontal)
-        add(thresholdRow)
+        addSetup(thresholdRow, height: 24)
+        calibrationEyeStatus.font = .systemFont(ofSize: 11)
+        calibrationEyeStatus.textColor = .secondaryLabelColor
+        add(calibrationEyeStatus, height: 44)
+        // Reserve status space so live text never shifts the webcam below it.
+        title("Tracking controls")
+        add(diagnosticText, height: 20)
+        if hybrid { previewAlignButton.bezelStyle = .rounded; add(previewAlignButton, height: 28) }
         add(clearEyeRegion, height: 28)
         if hybrid {
             title("Webcam status")
@@ -1323,7 +1329,7 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
         secondaryEyeStatus.toolTip = rig.eyes["right"]?.error ?? secondaryEyeStatus.stringValue
         if rig.eyes["left"]?.connected != true { preview.image = nil }
         if rig.eyes["right"]?.connected != true { secondaryEyePreview.image = nil }
-        calibrationEyeStatus.stringValue = "Both pupils are tracked. Screen calibration and the 3D view use the \(rig.active_eye) eye."
+        calibrationEyeStatus.stringValue = "EyeCursor calibration uses the \(rig.active_eye) eye. The 3D view shows both camera directions."
         updateEyeSelection(primary: rig.active_eye)
         guard !eyeSetupPending else { return }
         let devices = rig.devices.sorted { $0.id < $1.id }

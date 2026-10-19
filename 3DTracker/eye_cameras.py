@@ -1,6 +1,7 @@
 """Independent USB eye streams and detection results, bound to stable device IDs."""
 from collections import deque
 import json
+import math
 from pathlib import Path
 import threading
 import time
@@ -231,6 +232,7 @@ class EyeCameraRig:
                 return
             valid = bool(result and result.get('pupil_ellipse') and result.get('confidence', 0) >= threshold)
             self.tracking[eye] = {'time': sample['time'], 'serial': sample['serial'], 'jpeg': jpeg,
+                                  'epoch': (sample['revision'], sample['session']),
                                   'valid': valid, 'result': result}
             self.tracking_errors.pop(eye, None)
             self.tracking_times[eye].append(sample['time'])
@@ -252,17 +254,30 @@ class EyeCameraRig:
                 times = self.times[eye]
                 fps = (len(times) - 1) / (times[-1] - times[0]) if connected and len(times) > 1 and times[-1] > times[0] else 0
                 tracked = self.tracking.get(eye)
-                tracking_fresh = bool(connected and tracked and self.clock() - tracked['time'] < .5)
+                tracking_fresh = bool(connected and tracked and self.clock() - tracked['time'] < .5
+                                      and tracked['epoch'] == (sample['revision'], sample['session']))
                 result = (tracked['result'] or {}) if tracking_fresh else {}
                 tracking_times = self.tracking_times[eye]
                 tracking_fps = ((len(tracking_times) - 1) / (tracking_times[-1] - tracking_times[0])
                                 if tracking_fresh and len(tracking_times) > 1 and tracking_times[-1] > tracking_times[0] else 0)
+                direction = None
+                vector = result.get('gaze_direction')
+                head = (result.get('head_pose') or {}).get('features')
+                def finite(values, count):
+                    return (isinstance(values, (list, tuple)) and len(values) == count
+                            and all(isinstance(v, (int, float)) and math.isfinite(v) for v in values))
+                if (tracking_fresh and tracked['valid'] and result.get('eye_model_estimated')
+                        and finite(vector, 3) and sum(v*v for v in vector) > 1e-6
+                        and finite(head, 6)):
+                    direction = {'vector': vector, 'head_features': head}
                 eyes[eye] = {**self.config[eye], 'connected': connected, 'fps': fps,
                              'tracking_fps': tracking_fps,
                              'tracking': ('Pupil tracked' if tracked['valid'] else 'Searching for pupil') if tracking_fresh else 'Waiting for detection',
                              'confidence': result.get('confidence'),
                              'pupil_center': (result.get('pupil_ellipse') or {}).get('center'),
                              'gaze_direction': result.get('gaze_direction'),
+                             'scene_direction': direction,
+                             'tracking_epoch': f'{self.revisions[eye]}:{self.sessions[eye]}',
                              'error': self.errors.get(eye) or self.tracking_errors.get(eye),
                              'status': ('Connected' if connected else 'Disconnected' if self.config[eye]['device_id'] else 'Not assigned')}
             return {'active_eye': self.config['active_eye'], 'eyes': eyes,

@@ -238,6 +238,47 @@ class EyeCameraTests(unittest.TestCase):
         first.reset_tracking_state()
         self.assertIsNotNone(second.get_last_tracking_result())
 
+    def test_scene_directions_require_valid_modeled_pupils_and_paired_head(self):
+        pose = [0., 0., 0., .5, .4, -1.2]
+        result = {'pupil_ellipse': {'center': [320, 240]}, 'confidence': .9,
+                  'gaze_direction': [.1, .2, .97], 'eye_model_estimated': True,
+                  'head_pose': {'features': pose}}
+        for eye in ('left', 'right'):
+            self.publish(eye)
+            self.rig.publish_tracking(eye, self.rig.snapshot(eye), result, b'jpg', .5)
+        directions = self.rig.status()['eyes']
+        self.assertEqual(directions['left']['scene_direction']['head_features'], pose)
+        self.assertEqual(directions['right']['scene_direction']['vector'], [.1, .2, .97])
+        for invalid in (dict(result, confidence=.1), dict(result, eye_model_estimated=False),
+                        dict(result, head_pose=None), dict(result, gaze_direction=[0, 0, 0]),
+                        dict(result, gaze_direction=[float('nan'), 0, 1])):
+            self.publish('left')
+            self.rig.publish_tracking('left', self.rig.snapshot('left'), invalid, b'jpg', .5)
+            self.assertIsNone(self.rig.status()['eyes']['left']['scene_direction'])
+            self.assertIsNotNone(self.rig.status()['eyes']['right']['scene_direction'])
+        self.rig.sessions['right'] += 1
+        self.publish('right')
+        self.assertIsNone(self.rig.status()['eyes']['right']['scene_direction'], 'Old-session rays must disappear immediately')
+        self.now += .6
+        self.assertTrue(all(slot['scene_direction'] is None for slot in self.rig.status()['eyes'].values()))
+
+    def test_companion_pairs_head_to_its_own_capture_time(self):
+        calibration = Calibration('Left eye camera')
+        calibration.eye_cameras = self.rig
+        calibration.head_camera = Mock()
+        pose = {'features': [0., 0., 0., .5, .4, -1.2]}
+        calibration.head_camera.sample_at.return_value = pose
+        detector = Mock()
+        detector.get_last_tracking_result.return_value = {
+            'pupil_ellipse': {'center': [320, 240], 'axes': [80, 64], 'angle_degrees': 0},
+            'confidence': .9, 'gaze_direction': [0, 0, 1], 'eye_model_estimated': True}
+        worker = CompanionEyeTracker(calibration, render_diagnostic_frame, detector)
+        self.publish('right')
+        worker.process_next()
+        calibration.head_camera.sample_at.assert_called_once_with(self.now)
+        self.assertEqual(self.rig.status()['eyes']['right']['scene_direction']['head_features'], pose['features'])
+        self.assertIsNone(calibration.latest, 'Scene rays must not feed the single cursor calibration')
+
 
 if __name__ == '__main__':
     unittest.main()

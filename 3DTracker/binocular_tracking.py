@@ -47,6 +47,8 @@ class CompanionEyeTracker:
         self.detector.pupil_confidence_threshold_sphere = threshold
         self.detector.process_frame(sample['frame'], timestamp=sample['time'])
         result = self.detector.get_last_tracking_result()
+        if result is not None and self.calibration.head_camera is not None:
+            result['head_pose'] = self.calibration.head_camera.sample_at(sample['time'])
         image = self.render(sample['frame'], result, threshold=threshold)
         ok, jpeg = cv2.imencode('.jpg', image, [cv2.IMWRITE_JPEG_QUALITY, 78])
         if ok:
