@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EyeCursor sessions</title>
+<style>
+  :root { font: 15px/1.45 -apple-system, BlinkMacSystemFont, sans-serif; color: #eaf4ff; background: #0b1321; }
+  * { box-sizing: border-box; }
+  body { margin: 0; }
+  header { padding: 18px 24px; border-bottom: 1px solid #33465f; background: #111e31; display: flex; gap: 24px; align-items: center; }
+  header a { color: #9fd4ff; }
+  main { display: grid; grid-template-columns: 315px minmax(0,1fr); min-height: calc(100vh - 68px); }
+  aside { padding: 22px; border-right: 1px solid #33465f; background: #101b2d; }
+  section { padding: 22px; min-width: 0; }
+  h1 { font-size: 19px; margin: 0; }
+  h2 { font-size: 16px; margin: 0 0 14px; }
+  p { color: #aebed1; margin: 10px 0 16px; }
+  label { display: block; margin: 14px 0; }
+  select, button { font: inherit; border-radius: 8px; padding: 9px 11px; }
+  select { display: block; width: 100%; margin-top: 6px; color: #fff; background: #17263b; border: 1px solid #55708e; }
+  button { border: 0; background: #78bdf5; color: #071b2b; font-weight: 700; cursor: pointer; }
+  button:disabled { opacity: .45; cursor: default; }
+  button.secondary { background: #39516a; color: #e9f4ff; }
+  .buttons { display: flex; gap: 8px; }
+  .small { font-size: 13px; }
+  #message { min-height: 45px; margin: 12px 0; color: #ffd187; }
+  #sessions { display: grid; gap: 7px; margin-top: 15px; }
+  .session { width: 100%; text-align: left; background: #1a2b42; color: #eaf4ff; }
+  .session.active { outline: 2px solid #77bbf4; }
+  .session span { display: block; color: #a8b9cb; font-size: 12px; }
+  #viewer { max-width: 1250px; }
+  #screen { position: relative; width: 100%; background: #000; overflow: hidden; }
+  video { width: 100%; display: block; }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+  .toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 16px; margin: 14px 0; }
+  .toolbar a { color: #9fd4ff; }
+  .toolbar label { margin: 0; }
+  .stats { display: flex; flex-wrap: wrap; gap: 9px; }
+  .stats span { border: 1px solid #435c76; border-radius: 8px; padding: 6px 9px; background: #15263a; }
+  @media(max-width:800px) { main { display:block; } aside { border-right:0; border-bottom:1px solid #33465f; } }
+</style>
+<header><h1>EyeCursor sessions</h1><a href="http://127.0.0.1:8765/">Open eye calibration</a><span class="small">Local files only</span></header>
+<main>
+  <aside>
+    <h2>Record this display</h2>
+    <p>Finish the four-corner calibration, then select the same monitor here. Screen video, gaze samples, and cursor positions use one session timeline.</p>
+    <label>Display<select id="display"></select></label>
+    <div class="buttons"><button id="start">Start recording</button><button id="stop" class="secondary" disabled>Stop</button></div>
+    <div id="message" role="status"></div>
+    <h2>Saved sessions</h2>
+    <div id="sessions"></div>
+  </aside>
+  <section id="viewer">
+    <h2 id="title">Choose a session</h2>
+    <div id="screen"><video id="video" controls playsinline preload="metadata"></video><canvas id="overlay"></canvas></div>
+    <div class="toolbar"><label><input type="checkbox" id="heatmap"> Heatmap through current time</label><label><input type="checkbox" id="cursor" checked> Cursor</label><label><input type="checkbox" id="gaze" checked> Gaze point</label><a id="tracking" hidden download="tracking.json">Download coordinates JSON</a></div>
+    <div class="stats" id="stats"></div>
+    <p class="small">Colored gaze positions are estimates from the single eye camera. Gaps mean the pupil was not tracked confidently. The recording includes the visible cursor; the cursor coordinates are also saved separately.</p>
+  </section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+let selected = null, data = null, active = null, lastDraw = 0;
+async function api(path, options) {
+  const response = await fetch(path, options);
+  const payload = await response.json();
+  if (!response.ok) throw Error(payload.error || `HTTP ${response.status}`);
+  return payload;
+}
+function notice(text) { $('message').textContent = text; }
+function showStatus(status) {
+  active = status.active;
+  $('start').disabled = !!active;
+  $('stop').disabled = !active;
+  if (active) notice(`Recording ${active}. Stop to finalize the video.`);
+}
+async function refreshDisplays() {
+  try {
+    const [list, config] = await Promise.all([api('/api/displays'), api('/api/config')]);
+    $('display').replaceChildren(...list.map((item, index) => {
+      const option = document.createElement('option');
+      option.value = item.id;
+      option.textContent = `Display ${item.id} · ${item.width}×${item.height} · position ${item.x}, ${item.y}`;
+      if (item.id === config.default_display_id || !config.default_display_id && index === 0) option.selected = true;
+      return option;
+    }));
+  } catch (error) { notice(error.message); }
+}
+async function refreshSessions() {
+  const list = await api('/api/sessions');
+  $('sessions').replaceChildren(...list.map(item => {
+    const button = document.createElement('button');
+    button.className = `session ${selected === item.id ? 'active' : ''}`;
+    button.innerHTML = `${new Date(item.created_at).toLocaleString()}<span>${item.status} · display ${item.display.id} · ${item.gaze_samples ?? 0} gaze samples</span>`;
+    button.onclick = () => loadSession(item.id);
+    return button;
+  }));
+}
+async function loadSession(id) {
+  selected = id;
+  data = await api(`/api/sessions/${id}/data`);
+  $('title').textContent = `Session ${new Date(data.manifest.created_at).toLocaleString()}`;
+  $('video').src = `/api/sessions/${id}/video`;
+  $('tracking').href = `/api/sessions/${id}/tracking`;
+  $('tracking').hidden = false;
+  const valid = data.gaze.filter(item => item.valid).length;
+  $('stats').replaceChildren(...[
+    `Duration ${(data.manifest.duration_ms / 1000 || 0).toFixed(1)} s`,
+    `${data.manifest.screen_frames ?? data.frames.length} screen frames`, `${valid}/${data.gaze.length} valid gaze samples`,
+    `Display ${data.manifest.display.id}`].map(text => {
+      const span = document.createElement('span'); span.textContent = text; return span;
+    }));
+  refreshSessions(); draw();
+}
+function nearest(items, ms) {
+  if (!items?.length) return null;
+  let low = 0, high = items.length - 1;
+  while (low < high) { const mid = (low + high) >> 1; if (items[mid].t_ms < ms) low = mid + 1; else high = mid; }
+  return low && Math.abs(items[low-1].t_ms - ms) < Math.abs(items[low].t_ms - ms) ? items[low-1] : items[low];
+}
+function draw() {
+  const video = $('video'), canvas = $('overlay');
+  const w = video.videoWidth || 1280, h = video.videoHeight || 720;
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+  const ctx = canvas.getContext('2d'); ctx.clearRect(0, 0, w, h);
+  if (!data) return;
+  const ms = video.currentTime * 1000;
+  if ($('heatmap').checked) {
+    const samples = data.gaze.filter(item => item.valid && item.t_ms <= ms);
+    const stride = Math.max(1, Math.ceil(samples.length / 1500));
+    for (let i = 0; i < samples.length; i += stride) {
+      const item = samples[i], x = item.x * w, y = item.y * h, radius = Math.min(w, h) * .075;
+      const gradient = ctx.createRadialGradient(x, y, 0, x, y, radius);
+      gradient.addColorStop(0, 'rgba(255,65,30,.11)'); gradient.addColorStop(1, 'rgba(255,65,30,0)');
+      ctx.fillStyle = gradient; ctx.fillRect(x-radius, y-radius, radius*2, radius*2);
+    }
+  }
+  const gaze = nearest(data.gaze, ms);
+  if ($('gaze').checked && gaze?.valid && Math.abs(gaze.t_ms-ms) < 180) {
+    const x = gaze.x * w, y = gaze.y * h;
+    ctx.beginPath(); ctx.arc(x, y, 18, 0, Math.PI*2); ctx.fillStyle = '#eaff66b3'; ctx.fill();
+    ctx.lineWidth = 3; ctx.strokeStyle = '#1b2024'; ctx.stroke();
+  }
+  const frame = nearest(data.frames, ms);
+  if ($('cursor').checked && frame?.cursor_on_display && Math.abs(frame.t_ms-ms) < 250) {
+    const x = frame.cursor_nx*w, y = frame.cursor_ny*h;
+    ctx.beginPath(); ctx.moveTo(x-12,y); ctx.lineTo(x+12,y); ctx.moveTo(x,y-12); ctx.lineTo(x,y+12);
+    ctx.lineWidth = 3; ctx.strokeStyle = '#59d7ff'; ctx.stroke();
+  }
+}
+$('start').onclick = async () => {
+  notice('Starting screen capture…'); $('start').disabled = true;
+  try { const session = await api('/api/start', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({display_id:Number($('display').value)})});
+    showStatus({active:session.id}); await refreshSessions();
+  } catch (error) { notice(error.message); $('start').disabled = false; }
+};
+$('stop').onclick = async () => {
+  $('stop').disabled = true; notice('Finalizing video…');
+  try { const session = await api('/api/stop', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
+    showStatus({active:null}); notice(session.error || 'Recording saved.'); await refreshSessions(); await loadSession(session.id);
+  } catch (error) { notice(error.message); $('stop').disabled = false; }
+};
+$('video').addEventListener('timeupdate', draw);
+$('video').addEventListener('seeked', draw);
+$('video').addEventListener('loadedmetadata', draw);
+['heatmap','cursor','gaze'].forEach(id => $(id).addEventListener('change', draw));
+Promise.all([refreshDisplays(), refreshSessions(), api('/api/status').then(showStatus)]).catch(error => notice(error.message));
+setInterval(() => { if (active) refreshSessions().catch(() => {}); }, 4000);
+</script>
+</html>

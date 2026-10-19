@@ -1,21 +1,31 @@
 import cv2
+import time
+from pupil_tracking import PupilTrack
+from eye_geometry import fit_eye_center, trace_iris, ellipse_normal, refine_pupil_with_iris, iris_supported_confidence, detect_pupil_in_iris
+import sys
 import random
 import math
 import numpy as np
-import tkinter as tk
-from tkinter import ttk, filedialog
+try:
+    import tkinter as tk
+    from tkinter import ttk, filedialog
+except ImportError:
+    tk = None
+    ttk = None
+    filedialog = None
 
 try:
     import gl_sphere
     GL_SPHERE_AVAILABLE = True
 except ImportError:
     GL_SPHERE_AVAILABLE = False
-    print("gl_sphere module not found. OpenGL rendering will be disabled.")
+    if __name__ == "__main__":
+        print("gl_sphere module not found. OpenGL rendering will be disabled.")
 
 ray_lines = []  # Store recent pupil ellipse rays
 model_centers = []  # Store recent estimated eye centers
 min_model_centers = 30  # Minimum model centers required before updating sphere radius
-max_rays = 100  # Limit the number of stored pupil rays
+max_rays = 180  # Keep varied recent pupil and iris observations
 prev_model_center_avg = (320,240)  # Preserve the last valid eye center
 max_observed_distance = 0  # Initialize adaptive radius
 last_sphere_radius_ellipse = None  # Last pupil ellipse used to expand the eye sphere radius
@@ -24,7 +34,11 @@ pupil_confidence_threshold = 0.85  # Minimum pupil confidence for storing a ray
 pupil_confidence_threshold_sphere = 0.65  # Minimum pupil confidence for determining eye sphere radius
 intersection_ray_count = 4  # Rays sampled for each intersection estimate
 minimum_intersection_angle_degrees = 8  # Minimum angle between sampled rays
-last_tracking_result = None  # Store the latest tracker output
+last_tracking_result = None
+_iris_search_pupil = None  # Store the latest tracker output
+_pupil_track = PupilTrack()
+eye_region = None  # Optional normalized eye-only search area, set by EyeCursor.
+DISPLAY_ENABLED = True
 
 capture_stuck_ellipses = False     # toggled with 'e'
 stuck_ellipses = []                # saved pupil ellipses
@@ -36,7 +50,8 @@ max_stuck_ellipses = 20           # safety cap
 def detect_cameras(max_cams=10):
     available_cameras = []
     for i in range(max_cams):
-        cap = cv2.VideoCapture(i, cv2.CAP_MSMF)
+        backend = cv2.CAP_AVFOUNDATION if sys.platform == "darwin" else cv2.CAP_MSMF if sys.platform == "win32" else cv2.CAP_ANY
+        cap = cv2.VideoCapture(i, backend)
         cap.set(cv2.CAP_PROP_FPS, 30)
         if cap.isOpened():
             available_cameras.append(i)
@@ -69,34 +84,34 @@ def apply_binary_threshold(image, darkestPixelValue, addedThreshold):
     return thresholded_image
 
 # Finds a square area of dark pixels in the image
-def get_darkest_area(image):
+def get_darkest_area(image, search_region=None):
     ignoreBounds = 20
     imageSkipSize = 10
     searchArea = 20
     internalSkipSize = 5
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    min_sum = float('inf')
-    darkest_point = None
 
-    for y in range(ignoreBounds, gray.shape[0] - ignoreBounds, imageSkipSize):
-        for x in range(ignoreBounds, gray.shape[1] - ignoreBounds, imageSkipSize):
-            current_sum = 0
-            num_pixels = 0
-            for dy in range(0, searchArea, internalSkipSize):
-                if y + dy >= gray.shape[0]:
-                    break
-                for dx in range(0, searchArea, internalSkipSize):
-                    if x + dx >= gray.shape[1]:
-                        break
-                    current_sum += gray[y + dy][x + dx]
-                    num_pixels += 1
-
-            if current_sum < min_sum and num_pixels > 0:
-                min_sum = current_sum
-                darkest_point = (x + searchArea // 2, y + searchArea // 2)
-
-    return darkest_point
+    # A selected eye area keeps a dark camera housing or image corner from
+    # becoming the pupil seed. The rest of the detector remains unchanged.
+    x0, y0, x1, y1 = eye_region or (0.0, 0.0, 1.0, 1.0)
+    if search_region is not None:
+        x0, y0 = max(x0, search_region[0]), max(y0, search_region[1])
+        x1, y1 = min(x1, search_region[2]), min(y1, search_region[3])
+    start_x = max(ignoreBounds, int(x0 * gray.shape[1]))
+    start_y = max(ignoreBounds, int(y0 * gray.shape[0]))
+    stop_x = min(gray.shape[1] - ignoreBounds, int(x1 * gray.shape[1]) - searchArea)
+    stop_y = min(gray.shape[0] - ignoreBounds, int(y1 * gray.shape[0]) - searchArea)
+    ys = np.arange(start_y, stop_y + 1, imageSkipSize)
+    xs = np.arange(start_x, stop_x + 1, imageSkipSize)
+    if not len(xs) or not len(ys):
+        return None
+    sums = np.zeros((len(ys), len(xs)), dtype=np.uint32)
+    for dy in range(0, searchArea, internalSkipSize):
+        for dx in range(0, searchArea, internalSkipSize):
+            sums += gray[np.ix_(ys + dy, xs + dx)]
+    row, column = np.unravel_index(np.argmin(sums), sums.shape)
+    return (int(xs[column]) + searchArea // 2, int(ys[row]) + searchArea // 2)
 
 # Mask all pixels outside a square defined by center and size
 def mask_outside_square(image, center, size):
@@ -279,7 +294,8 @@ def check_ellipse_goodness(binary_image, contour, debug_mode_on):
     ellipse_goodness = [0,0,0] #covered pixels, edge straightness stdev, skewedness   
     # Check if the contour can be used to fit an ellipse (requires at least 5 points)
     if len(contour) < 5:
-        print("length of contour was 0")
+        if debug_mode_on:
+            print("length of contour was 0")
         return 0  # Not enough points to fit an ellipse
     
     # Fit an ellipse to the contour
@@ -299,7 +315,8 @@ def check_ellipse_goodness(binary_image, contour, debug_mode_on):
     
     # Calculate the percentage of covered white pixels within the ellipse
     if ellipse_area == 0:
-        print("area was 0")
+        if debug_mode_on:
+            print("area was 0")
         return ellipse_goodness  # Avoid division by zero if the ellipse area is somehow zero
     
     #percentage of covered pixels to number of pixels under area
@@ -310,7 +327,7 @@ def check_ellipse_goodness(binary_image, contour, debug_mode_on):
     return ellipse_goodness
 
 # Process frames for pupil detection
-def process_frames(thresholded_image_strict, thresholded_image_medium, thresholded_image_relaxed, frame, gray_frame, darkest_point, debug_mode_on, render_cv_window):
+def process_frames(thresholded_image_strict, thresholded_image_medium, thresholded_image_relaxed, frame, gray_frame, darkest_point, debug_mode_on, render_cv_window, iris_hint=None, timestamp=None):
     global ray_lines
     global max_rays
     global prev_model_center_avg
@@ -344,8 +361,9 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
     best_center_x, best_center_y = None, None
 
     # iterate through binary images and see which fits the ellipse best
-    for i in range(1,4):
-        dilated_image = cv2.dilate(image_array[i-1], kernel, iterations=2)
+    for i in ([] if iris_hint else range(1,4)):
+        # Fill small IR reflection holes without expanding the pupil boundary.
+        dilated_image = cv2.morphologyEx(image_array[i-1], cv2.MORPH_CLOSE, kernel, iterations=2)
 
         contours, _ = cv2.findContours(
             dilated_image,
@@ -401,23 +419,84 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
     final_contours = [optimize_contours_by_angle(final_contours, gray_frame)]
     
     final_rotated_rect = None
+    iris = iris_hint
+    pupil_refinement = None
+    edge_pupil = None
+    raw_pupil = None
+    raw_pupil_confidence = best_ratio_under_ellipse
+    iris_pupil_confidence = 0.
+    new_ray = False
+    model_updated = False
 
-    if final_contours and not isinstance(final_contours[0], list) and len(final_contours[0] > 5):
-        ellipse = cv2.fitEllipse(final_contours[0])
-        final_rotated_rect = ellipse
+    if final_contours and not isinstance(final_contours[0], list) and len(final_contours[0]) > 5:
+        raw_pupil = cv2.fitEllipse(final_contours[0])
+        final_rotated_rect = raw_pupil
+        iris = trace_iris(gray_frame, raw_pupil)
 
+    if iris and iris.get('support', 0) >= .65:
+        # A verified iris switches selection to independent current-frame edges.
+        # A failed inner boundary must not fall back to a high-scoring dark blob.
+        edge_pupil = detect_pupil_in_iris(gray_frame, iris)
+        final_rotated_rect = edge_pupil['ellipse'] if edge_pupil else None
+        iris_pupil_confidence = edge_pupil['confidence'] if edge_pupil else 0.
+        best_ratio_under_ellipse = iris_pupil_confidence
+    elif raw_pupil is not None:
+        pupil_refinement = refine_pupil_with_iris(gray_frame, raw_pupil, iris, final_contours[0])
+        if pupil_refinement:
+            final_rotated_rect = pupil_refinement['ellipse']
+        iris_pupil_confidence = iris_supported_confidence(
+            gray_frame, final_rotated_rect, iris, raw_pupil_confidence)
+        best_ratio_under_ellipse = max(raw_pupil_confidence, iris_pupil_confidence)
+
+    temporal = _pupil_track.update(final_rotated_rect, best_ratio_under_ellipse, iris,
+                                   time.monotonic() if timestamp is None else timestamp)
+    if final_rotated_rect is not None and not temporal['accepted']:
+        # Keep the current candidate visible as rejected evidence, but never feed
+        # it into gaze, calibration, or eye-model updates. A rejection is not a blink.
+        last_tracking_result = {
+            "pupil_ellipse": {"center": list(final_rotated_rect[0]),
+                              "axes": list(final_rotated_rect[1]),
+                              "angle_degrees": float(final_rotated_rect[2])},
+            "iris_ellipse": ({"center": list(iris['ellipse'][0]),
+                             "axes": list(iris['ellipse'][1]),
+                             "angle_degrees": float(iris['ellipse'][2])} if iris else None),
+            "iris_support": iris['support'] if iris else 0,
+            "confidence": 0.,
+            "raw_pupil_confidence": float(raw_pupil_confidence),
+            "iris_pupil_confidence": float(iris_pupil_confidence),
+            "pupil_shape_source": "temporal-rejected",
+            "temporal_tracking": temporal,
+            "eye_model_updated": False,
+        }
+        return None
+
+    center_x, center_y = None, None
+    if final_rotated_rect is not None:
+        center_x, center_y = map(int, final_rotated_rect[0])
         if (
             eye_sphere_adjustment_enabled
             and best_ratio_under_ellipse >= pupil_confidence_threshold
         ):
-            ray_lines.append(final_rotated_rect)
+            # The enclosing iris provides a second ray only when its shape and
+            # orientation agree with a noncircular pupil. Eyelid-clipped iris
+            # contours must not give circular pupils a fabricated direction.
+            ray = final_rotated_rect
+            pupil_normal = ellipse_normal(ray)
+            iris_normal = ellipse_normal(iris['ellipse']) if iris else None
+            if (iris_normal is not None and pupil_normal is not None
+                    and abs(iris_normal[1] - pupil_normal[1]) < .12
+                    and abs(float(pupil_normal[0] @ iris_normal[0])) > .94):
+                ray = iris['ellipse']
+            if ellipse_normal(ray) is not None:
+                ray_lines.append(ray)
+                new_ray = True
             if len(ray_lines) > max_rays:
                 num_to_remove = len(ray_lines) - max_rays
                 ray_lines = ray_lines[num_to_remove:]  # Keep only the last `max_rays` elements
 
-    model_center_average = (320,240)
+    model_center_average = prev_model_center_avg
 
-    if eye_sphere_adjustment_enabled:
+    if eye_sphere_adjustment_enabled and new_ray:
         model_center = compute_average_intersection(
             frame,
             ray_lines,
@@ -426,12 +505,10 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
             minimum_intersection_angle_degrees,
         )
         if model_center is not None and model_center != (0, 0):
-            model_center_average = update_and_average_point(model_centers, model_center, 200)
+            model_center_average = update_and_average_point(model_centers, model_center, 45)
+            model_updated = True
 
-    if model_center_average[0] == 320:
-        model_center_average = prev_model_center_avg
-    if model_center_average[0] != 0:
-        prev_model_center_avg = model_center_average
+    prev_model_center_avg = model_center_average
     
     # Example safety check
     if center_x is None or center_y is None or model_center_average[0] is None or model_center_average[1] is None:
@@ -453,6 +530,21 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
         } if final_rotated_rect is not None else None,
         "eye_center": [int(model_center_average[0]), int(model_center_average[1])],
         "sphere_radius": float(max_observed_distance),
+        "eye_model_estimated": len(model_centers) >= min_model_centers,
+        "eye_model_updated": model_updated,
+        "iris_ellipse": ({"center": list(iris["ellipse"][0]), "axes": list(iris["ellipse"][1]),
+                          "angle_degrees": iris["ellipse"][2]} if iris else None),
+        "iris_support": iris["support"] if iris else 0,
+        "raw_pupil_confidence": float(raw_pupil_confidence),
+        "iris_pupil_confidence": float(iris_pupil_confidence),
+        "pupil_shape_source": edge_pupil.get("source", "iris-edge") if edge_pupil else "iris-assisted" if pupil_refinement else "pupil",
+        "pupil_shape_support": (edge_pupil or pupil_refinement or {}).get("edge_support", 0),
+        "pupil_edge_points": edge_pupil["edge_points"] if edge_pupil else [],
+        "raw_pupil_ellipse": ({"center": list(raw_pupil[0]), "axes": list(raw_pupil[1]),
+                               "angle_degrees": raw_pupil[2]} if raw_pupil else None),
+        "eye_model_samples": len(model_centers),
+        "confidence": float(best_ratio_under_ellipse),
+        "temporal_tracking": temporal,
     }
 
     # Draw reference lines/ellipses
@@ -509,6 +601,8 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
 
     # Call the function
     center, direction = compute_gaze_vector(center_x, center_y, model_center_average[0], model_center_average[1])
+    if last_tracking_result is not None and direction is not None:
+        last_tracking_result["gaze_direction"] = [float(value) for value in direction]
 
     if center is not None and direction is not None:
         origin_text = f"Origin: ({center[0]:.2f}, {center[1]:.2f}, {center[2]:.2f})"
@@ -531,7 +625,8 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
     cv2.putText(frame, ratio_text, (12, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4)
     cv2.putText(frame, ratio_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
-    cv2.imshow("Frame with Ellipse and Rays", frame)
+    if DISPLAY_ENABLED:
+        cv2.imshow("Frame with Ellipse and Rays", frame)
 
     if GL_SPHERE_AVAILABLE:
         if gl_image is not None:
@@ -550,6 +645,7 @@ def reset_tracking_state():
     global stored_intersections
     global capture_frame_counter
     global stuck_ellipses
+    global _iris_search_pupil
     global last_tracking_result
 
     ray_lines = []
@@ -561,6 +657,8 @@ def reset_tracking_state():
     stored_intersections = []
     capture_frame_counter = 0
     stuck_ellipses = []
+    _iris_search_pupil = None
+    _pupil_track.reset()
     last_tracking_result = None
 
 def get_last_tracking_result():
@@ -596,79 +694,11 @@ def update_and_average_point(point_list, new_point, N):
 stored_intersections = []  # Stores all past intersections
 
 def compute_average_intersection(frame, ray_lines, number_lines, total_lines, minimum_angle_degrees):
-    """
-    Selects `number_lines` random lines from the list, computes their intersections,
-    conditionally stores them (only if they agree within `pixel_limit`), and prunes
-    stored intersections when exceeding `total_lines`.
-    """
-    pixel_limit = 30
-    angle_threshold = 5  # degrees
-
-    global stored_intersections
-
-    if len(ray_lines) < 2 or number_lines < 2:
+    """Compatibility wrapper around a deterministic robust fit of all recent rays."""
+    fitted = fit_eye_center(ray_lines, frame.shape)
+    if fitted is None:
         return (0, 0)
-
-    height, width = frame.shape[:2]
-
-    selected_lines = random.sample(ray_lines, min(number_lines, len(ray_lines)))
-
-    intersections = []
-    for i in range(len(selected_lines) - 1):
-        line1 = selected_lines[i]
-        line2 = selected_lines[i + 1]
-
-        angle1 = line1[2]
-        angle2 = line2[2]
-
-        if abs(angle1 - angle2) >= minimum_angle_degrees:
-            intersection = find_line_intersection(line1, line2)
-            if intersection and (0 <= intersection[0] < width) and (0 <= intersection[1] < height):
-                intersections.append(intersection)
-
-    # Nothing usable this frame
-    if not intersections:
-        return (0, 0)
-
-    # Check mutual agreement within pixel_limit
-    accept = True
-    if len(intersections) >= 2:
-        for i in range(len(intersections)):
-            for j in range(i + 1, len(intersections)):
-                # --- distance check ---
-                dx = intersections[i][0] - intersections[j][0]
-                dy = intersections[i][1] - intersections[j][1]
-                if (dx * dx + dy * dy) ** 0.5 > pixel_limit:
-                    accept = False
-                    break
-
-                # --- angle check ---
-                angle_i = selected_lines[i][2]
-                angle_j = selected_lines[j][2]
-                if abs(angle_i - angle_j) < angle_threshold:
-                    accept = False
-                    break
-            if not accept:
-                break
-
-    if accept:
-        stored_intersections.extend(intersections)
-
-    # Prune stored intersections
-    if len(stored_intersections) > total_lines:
-        stored_intersections = prune_intersections(stored_intersections, total_lines)
-
-    if not stored_intersections:
-        return (0, 0)
-
-    avg_x = np.mean([pt[0] for pt in stored_intersections])
-    avg_y = np.mean([pt[1] for pt in stored_intersections])
-
-    if np.isnan(avg_x) or np.isnan(avg_y):
-        return (0, 0)
-
-    return (int(avg_x), int(avg_y))
-
+    return tuple(round(value) for value in fitted['center'])
 
 
 #Removes the oldest intersections to ensure only the last M intersections remain.
@@ -866,17 +896,44 @@ def draw_stuck_ellipses(frame):
             cv2.ellipse(frame, ellipse,(0, 255, 255), 2)
 
 # Finds the pupil in an individual frame and returns the center point
-def process_frame(frame):
+def process_frame(frame, timestamp=None):
+    global _iris_search_pupil, last_tracking_result
 
+    timestamp = time.monotonic() if timestamp is None else timestamp
 
     # Crop and resize frame
     frame = crop_to_aspect_ratio(frame)
 
-    #find the darkest point
-    darkest_point = get_darkest_area(frame)
-
-    # Convert to grayscale to handle pixel value operations
     gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    # Use the previous iris geometry only to locate its OUTER edge in this frame.
+    # Never reuse the previous iris or pupil as current detection evidence.
+    region = None
+    previous = last_tracking_result
+    if (previous and previous.get("iris_support", 0) >= .65
+            and previous.get("confidence", 0) >= .4 and previous.get("pupil_ellipse")):
+        iris = previous["iris_ellipse"]
+        _iris_search_pupil = (tuple(iris["center"]), tuple(a*.45 for a in iris["axes"]), iris["angle_degrees"])
+    if _iris_search_pupil is not None:
+        current_iris = trace_iris(gray_frame, _iris_search_pupil)
+        if current_iris and current_iris['support'] >= .65:
+            return process_frames(None, None, None, frame, gray_frame, None, False, False,
+                                  iris_hint=current_iris, timestamp=timestamp)
+        _iris_search_pupil = None
+    if previous and previous.get("iris_ellipse"):
+        iris = previous["iris_ellipse"]
+        cx, cy = iris["center"]
+        radius = max(iris["axes"]) * .65
+        region = [(cx-radius)/frame.shape[1], (cy-radius)/frame.shape[0],
+                  (cx+radius)/frame.shape[1], (cy+radius)/frame.shape[0]]
+    # Initial acquisition or lost outer boundary retains the legacy seed search.
+    darkest_point = get_darkest_area(frame, region)
+    if darkest_point is None:
+        darkest_point = get_darkest_area(frame)
+
+    if darkest_point is None:
+        _pupil_track.update(None, 0., None, timestamp)
+        last_tracking_result = None
+        return None
     darkest_pixel_value = gray_frame[darkest_point[1], darkest_point[0]]
     
     # apply thresholding operations at different levels
@@ -891,7 +948,9 @@ def process_frame(frame):
     thresholded_image_relaxed = mask_outside_square(thresholded_image_relaxed, darkest_point, 250)
     
     #take the three images thresholded at different levels and process them
-    final_rotated_rect = process_frames(thresholded_image_strict, thresholded_image_medium, thresholded_image_relaxed, frame, gray_frame, darkest_point, False, False)
+    final_rotated_rect = process_frames(thresholded_image_strict, thresholded_image_medium, thresholded_image_relaxed, frame, gray_frame, darkest_point, False, False, timestamp=timestamp)
+    if last_tracking_result is not None:
+        last_tracking_result["seed_point"] = list(darkest_point)
     
     return final_rotated_rect
 
@@ -906,7 +965,8 @@ def process_camera():
     cam_index = int(selected_camera.get())
 
     reset_tracking_state()
-    cap = cv2.VideoCapture(cam_index, cv2.CAP_MSMF)
+    backend = cv2.CAP_AVFOUNDATION if sys.platform == "darwin" else cv2.CAP_MSMF if sys.platform == "win32" else cv2.CAP_ANY
+    cap = cv2.VideoCapture(cam_index, backend)
 
     if not cap.isOpened():
         print("Error: Could not open camera.")
@@ -940,6 +1000,14 @@ def process_camera():
     cap.release()
     cv2.destroyAllWindows()
 
+def video_frame_timestamp(capture):
+    """Use the recorded frame clock even when playback runs faster than real time."""
+    fps = capture.get(cv2.CAP_PROP_FPS)
+    if not math.isfinite(fps) or fps <= 0:
+        fps = 30.
+    return max(0., capture.get(cv2.CAP_PROP_POS_FRAMES) - 1) / fps
+
+
 # Process a selected video file
 def process_video():
     video_path = filedialog.askopenfilename(filetypes=[("Video Files", "*.mp4;*.avi")])
@@ -959,7 +1027,7 @@ def process_video():
         if not ret:
             break
 
-        process_frame(frame)
+        process_frame(frame, timestamp=video_frame_timestamp(cap))
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
@@ -976,6 +1044,8 @@ def process_video():
 # GUI for selecting camera or video
 def selection_gui():
     global selected_camera
+    if tk is None:
+        raise SystemExit("Tkinter is unavailable. On macOS use: python 3DTracker/monitor_demo.py --camera 0")
     cameras = detect_cameras()
 
     # Create Tkinter window

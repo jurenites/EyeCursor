@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="110 80 804 804">
+  <title>EyeCursor menu bar</title>
+  <desc>Fixed black and white icon: strong black outline, white eyeball, black pupil, and white cursor.</desc>
+  <circle cx="512" cy="482" r="372" fill="#000000"/>
+  <circle cx="512" cy="482" r="312" fill="#FFFFFF"/>
+  <circle cx="476" cy="438" r="235" fill="#000000"/>
+  <path fill="#FFFFFF" d="M 464.56 319.88 Q 361.62 233.62 361.62 419.17 L 361.62 456.75 C 361.62 528.00 389.75 563.62 427.25 522.38 Q 455.38 496.12 481.16 541.73 L 483.03 545.06 Q 494.75 565.50 515.94 553.31 L 539.19 540.19 Q 560.38 528.00 548.38 507.19 L 548.15 506.79 Q 522.88 462.38 562.96 462.38 L 561.01 462.38 Q 629.75 462.38 526.81 374.55 Z"/>
+</svg>

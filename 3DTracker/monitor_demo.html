@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Single-eye monitor calibration</title>
+<style>
+  :root { color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #0b1220; color: #f5f7fb; }
+  * { box-sizing: border-box; }
+  body { margin: 0; }
+  .bar { position: fixed; z-index: 4; inset: 0 0 auto; display: flex; align-items: center; gap: 18px; padding: 14px 22px; background: #111d2eea; border-bottom: 1px solid #38506a; }
+  .bar strong { font-size: 15px; }
+  .bar span { color: #aabbd0; font-size: 13px; }
+  .status { margin-left: auto; border-radius: 999px; padding: 6px 10px; background: #394357; font-size: 13px; }
+  .status.good { background: #124f47; color: #a6f7dc; }
+  .stage { position: fixed; inset: 0; background: radial-gradient(circle at center, #182b46, #0b1220 70%); overflow: hidden; }
+  .grid { position: absolute; inset: 8%; border: 1px solid #4d647a77; background: linear-gradient(90deg, transparent 49.9%, #4d647a33 50%, transparent 50.1%), linear-gradient(transparent 49.9%, #4d647a33 50%, transparent 50.1%); }
+  .target { position: absolute; transform: translate(-50%, -50%); width: 64px; height: 64px; border: 2px solid #a8c9ed; border-radius: 50%; background: #112139; color: #eff7ff; font-size: 30px; cursor: pointer; box-shadow: 0 0 0 9px #78aeec22; }
+  .target.active { border-color: #ffcb70; background: #684216; box-shadow: 0 0 0 14px #ffcb702e, 0 0 35px #ffcb70aa; }
+  .target.done { border-color: #6de6ad; color: #6de6ad; }
+  .target:disabled { cursor: default; }
+  #gaze { position: absolute; z-index: 5; width: 16px; height: 16px; background: rgb(255 255 255 / 55%); border-radius: 50%; transform: translate(-50%, -50%); pointer-events: none; display: none; transition: left 90ms linear, top 90ms linear; }
+  .panel { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); width: min(440px, calc(100vw - 36px)); padding: 24px; background: #111d2eea; border: 1px solid #4d647a; border-radius: 18px; box-shadow: 0 15px 65px #0008; }
+  .panel.compact { top: auto; bottom: 16px; transform: translateX(-50%); width: min(610px, calc(100vw - 36px)); padding: 12px 16px; }
+  .panel.compact h1 { font-size: 16px; margin-bottom: 5px; }
+  .panel.compact p:not(#result), .panel.compact label { display: none; }
+  .panel.compact .actions { margin-top: 5px; }
+  .panel.compact #result { margin: 8px 0 0; }
+  h1 { font-size: 22px; margin: 0 0 12px; }
+  p { color: #b7c5d6; line-height: 1.45; margin: 0 0 14px; font-size: 14px; }
+  label { display: block; color: #c9d7e4; font-size: 13px; margin: 12px 0; }
+  input { display: block; width: 100%; margin-top: 5px; background: #0b1525; border: 1px solid #52677b; border-radius: 8px; padding: 9px; color: #fff; font: inherit; }
+  .actions { display: flex; gap: 9px; margin-top: 16px; }
+  button.action { padding: 10px 13px; border: 0; border-radius: 9px; background: #72b0f6; color: #081322; font-weight: 700; cursor: pointer; }
+  button.secondary { background: #35475d; color: #e6f0fa; }
+  #message { min-height: 18px; color: #ffcd83; margin-top: 12px; font-size: 13px; }
+  #detail { font-variant-numeric: tabular-nums; }
+</style>
+<div class="bar"><strong>EyeCursor / monitor demo</strong><span id="detail">Waiting for frames</span><span id="region">Calibrate to predict a screen region</span><a href="http://127.0.0.1:8766/" target="_blank" style="color:#9fd4ff">Record / replay</a><span class="status" id="status">No eye</span></div>
+<main class="stage" id="stage">
+  <div class="grid"></div>
+  <button class="target" data-target="top_left" style="left:8%;top:8%" aria-label="Top left corner">+</button>
+  <button class="target" data-target="top_right" style="left:92%;top:8%" aria-label="Top right corner">+</button>
+  <button class="target" data-target="bottom_right" style="left:92%;top:92%" aria-label="Bottom right corner">+</button>
+  <button class="target" data-target="bottom_left" style="left:8%;top:92%" aria-label="Bottom left corner">+</button>
+  <button class="target" data-target="center" style="left:50%;top:50%" aria-label="Center validation">+</button>
+  <div id="gaze" aria-hidden="true"></div>
+  <section class="panel">
+    <h1>Calibrate your screen</h1>
+    <p>Move this page to the monitor you want to track and enter full screen first. Keep the camera fixed beside one eye and sit in your usual chair position. Move only your eye. Look at each highlighted target, wait a moment, then click it or press Space.</p>
+    <div class="actions"><button class="action" id="capture">Capture highlighted target</button><button class="action secondary" id="reset">Start over</button><button class="action secondary" id="fullscreen">Full screen</button></div>
+    <div id="message" role="status"></div>
+    <p id="result"></p>
+  </section>
+</main>
+<script>
+  const order = ['top_left', 'top_right', 'bottom_right', 'bottom_left', 'center'];
+  const labels = {top_left:'top left', top_right:'top right', bottom_right:'bottom right', bottom_left:'bottom left', center:'center check'};
+  let captured = [];
+  let centerDone = false;
+  let live = null;
+  const $ = id => document.getElementById(id);
+  const targetButtons = [...document.querySelectorAll('.target')];
+  function currentTarget() { return order.find(key => key === 'center' ? !centerDone && captured.length === 4 : !captured.includes(key)); }
+  function updateTargets() {
+    const next = currentTarget();
+    targetButtons.forEach(button => {
+      const key = button.dataset.target;
+      button.classList.toggle('active', key === next);
+      button.classList.toggle('done', captured.includes(key) || (key === 'center' && centerDone));
+      button.textContent = captured.includes(key) || (key === 'center' && centerDone) ? '✓' : '+';
+    });
+    $('capture').textContent = next ? `Capture ${labels[next]}` : 'Calibration complete';
+    $('capture').disabled = !next;
+  }
+  async function post(path, data = {}) {
+    const response = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(data)});
+    const payload = await response.json();
+    if (!response.ok) throw Error(payload.error || 'Request failed');
+    return payload;
+  }
+  async function capture(key = currentTarget()) {
+    if (!key) return;
+    if (key !== currentTarget()) { $('message').textContent = 'Follow the highlighted targets in order.'; return; }
+    if (live?.source === 'video demo') { $('message').textContent = 'The sample video checks tracking only. Use the live eye camera for screen calibration.'; return; }
+    if (!document.fullscreenElement) { $('message').textContent = 'Enter full screen on the monitor you want to calibrate first.'; return; }
+    try {
+      const area = $('stage').getBoundingClientRect();
+      const scaleX = screen.width / innerWidth;
+      const scaleY = screen.height / innerHeight;
+      const viewport = [window.screenX + area.left * scaleX, window.screenY + area.top * scaleY, area.width * scaleX, area.height * scaleY];
+      const response = await post('/capture', {target:key, viewport});
+      if (key === 'center') {
+        centerDone = true;
+        $('result').textContent = `Center error: ${response.center_error[0]}% of screen width horizontally, ${response.center_error[1]}% of screen height vertically. Smaller is better.`;
+      } else {
+        captured = response.captured;
+        if (captured.length) document.querySelector('.panel').classList.add('compact');
+        $('result').textContent = response.calibrated ? 'Mapping ready. Look around the screen, then check the center.' : `${captured.length} of 4 corners captured.`;
+      }
+      $('message').textContent = '';
+      updateTargets();
+    } catch (error) { $('message').textContent = error.message; }
+  }
+  $('capture').onclick = () => capture();
+  $('reset').onclick = async () => {
+    await post('/reset'); captured = []; centerDone = false;
+    document.querySelector('.panel').classList.remove('compact');
+    $('result').textContent = ''; $('message').textContent = ''; updateTargets();
+  };
+  $('fullscreen').onclick = () => document.documentElement.requestFullscreen();
+  document.addEventListener('fullscreenchange', async () => {
+    if (!document.fullscreenElement && captured.length) {
+      if (captured.length === 4) {
+        $('gaze').style.display = 'none';
+        $('message').textContent = 'Calibration is kept for recording. Keep the same camera and seating position.';
+        return;
+      }
+      await post('/reset'); captured = []; centerDone = false;
+      document.querySelector('.panel').classList.remove('compact');
+      $('result').textContent = '';
+      $('message').textContent = 'Full screen ended, so the screen mapping was reset.';
+      updateTargets();
+    }
+  });
+  targetButtons.forEach(button => button.onclick = () => capture(button.dataset.target));
+  document.addEventListener('keydown', event => { if (event.code === 'Space' && event.target.tagName !== 'INPUT') { event.preventDefault(); capture(); } });
+  async function refresh() {
+    try {
+      live = await (await fetch('/state', {cache:'no-store'})).json();
+      const good = live.valid;
+      $('status').textContent = !live.camera_connected ? 'Camera reconnecting' : good ? 'Pupil tracked' : 'No usable pupil';
+      $('status').classList.toggle('good', good);
+      $('detail').textContent = `${live.source} · confidence ${Math.round(live.confidence * 100)}%`;
+      const gaze = $('gaze');
+      gaze.style.display = good && live.gaze && !live.desktop_cursor ? 'block' : 'none';
+      if (good && live.gaze) {
+        gaze.style.left = `${Math.max(0, Math.min(100, live.gaze[0] * 100))}%`;
+        gaze.style.top = `${Math.max(0, Math.min(100, live.gaze[1] * 100))}%`;
+      }
+      $('region').textContent = good && live.gaze ? `Looking: ${live.gaze[1] < .5 ? 'top' : 'bottom'} ${live.gaze[0] < .5 ? 'left' : 'right'}` : live.calibrated ? 'Looking: unavailable' : 'Calibrate to predict a screen region';
+      if (captured.join(',') !== live.captured.join(',')) {
+        if (captured.length && !live.captured.length) {
+          centerDone = false;
+          $('result').textContent = '';
+          $('message').textContent = 'The eye stream restarted. Calibrate again before recording.';
+        }
+        captured = live.captured;
+        document.querySelector('.panel').classList.toggle('compact', !!captured.length);
+        updateTargets();
+      }
+    } catch { $('status').textContent = 'Tracker disconnected'; $('gaze').style.display = 'none'; }
+  }
+  updateTargets(); refresh(); setInterval(refresh, 100);
+</script>
+</html>
