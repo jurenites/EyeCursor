@@ -70,6 +70,18 @@ class RecoveryTests(unittest.TestCase):
         self.now = 1
         self.assertFalse(self.source.read()[0])
 
+    def test_slow_worker_startup_gets_warmup_then_normal_dropout_deadline(self):
+        self.source.release()
+        source=ReconnectingCapture(self.opener,clock=lambda:self.now,warmup_seconds=8.)
+        self.addCleanup(source.release)
+        self.now=4;source.read()
+        self.assertIsNotNone(source.capture)
+        self.device.read.return_value=(True,self.frame)
+        self.now=5;self.assertTrue(source.read()[0])
+        self.device.read.return_value=(False,None)
+        self.now=8.1;source.read()
+        self.assertIsNone(source.capture)
+
     def test_reconnect_follows_id_when_index_changes(self):
         camera = {'name': 'USB Camera', 'id': 'eye', 'index': 0}
         moved = dict(camera, index=2)

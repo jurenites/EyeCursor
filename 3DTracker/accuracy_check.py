@@ -30,13 +30,15 @@ class AccuracyCheck:
         if not 0<=now-stamp<=.15:
             self.reject('Waiting for fresh eye measurements');return False
         if stamp-self.started<.8:return False
-        eye=np.asarray(eye,dtype=float);predicted=np.asarray(predicted,dtype=float)
-        if eye.shape!=(2,) or predicted.shape!=(2,) or not np.isfinite(np.r_[eye,predicted]).all():
-            self.reject('Gaze unavailable at this position');return False
+        eye=np.asarray(eye,dtype=float)
+        if eye.shape!=(2,) or not np.isfinite(eye).all():
+            self.reject('Eye measurement unavailable');return False
+        predicted=np.asarray(predicted,dtype=float) if predicted is not None else None
+        if predicted is not None and (predicted.shape!=(2,) or not np.isfinite(predicted).all()):predicted=None
         self.last_stamp=stamp
         append_fixation(self.block,eye,stamp)
         self.predictions={t:self.predictions[t] for t,_ in self.block if t in self.predictions}
-        self.predictions[stamp]=predicted.copy()
+        self.predictions[stamp]=predicted.copy() if predicted is not None else None
         self.reason='Hold at the dot; collecting a stable fixation'
         return True
 
@@ -44,9 +46,10 @@ class AccuracyCheck:
         if self.done:return
         ready=QuickCalibration.ready(self.block) and now-self.block[-1][0]<=.15
         if not ready and now-self.started<self.TIMEOUT:return
-        row={'target':self.target,'measured':None,'error_points':None,'precision_points':None,'samples':0}
+        row={'target':self.target,'measured':None,'error_points':None,'precision_points':None,'samples':0,'captured_samples':len(self.block) if ready else 0}
         if ready:
-            points=np.array([self.predictions[t] for t,_ in self.block])
+            points=np.array([self.predictions[t] for t,_ in self.block if self.predictions[t] is not None])
+        if ready and len(points)>=6:
             measured=np.median(points,axis=0)
             row.update(measured=measured.tolist(),samples=len(points),
                 error_points=float(np.mean(np.linalg.norm((points-CHECK_TARGETS[self.index])*self.size,axis=1))),

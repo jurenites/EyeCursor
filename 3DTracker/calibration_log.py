@@ -9,7 +9,7 @@ import numpy as np
 MODEL_FIELDS=('reference','coefficients','bounds','error','mode','eyes','offset','shift',
               'anchors','eye_scale','residuals','pose_scale','rank','support','status',
               'pair_count','fit_error','depth','reference_width','aspect','camera_aspect',
-              'head_coefficients','eye_center','validation_error')
+              'head_coefficients','eye_center','validation_error','degree','ridge','fit_metrics')
 
 
 def numeric(value):

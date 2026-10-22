@@ -129,57 +129,8 @@ class SphereWidget(QOpenGLWidget):
         glTranslatef(gl_x * 1.5, gl_y * 1.5, 0.0)
         
 
-        # Draw ray (NOT rotated by sphere rotation)
-        if self.ray_origin is not None and self.ray_direction is not None:
-            glBegin(GL_LINES)
-            glColor3f(1.0, 1.0, 1.0)  
-            glVertex3fv(self.ray_origin)
-            glColor3f(0.0, 0.0, 0.0)  
-            glVertex3fv(self.ray_origin - self.ray_direction * 5.5)
-            glEnd()
-
-
         plane_z = 1/1.05
         inner_radius = abs(plane_z)
-
-        # Draw ray-to-inner-sphere intersection marker
-        if self.ray_origin is not None and self.ray_direction is not None:
-            inner_radius = abs(plane_z)
-            origin = self.ray_origin
-            direction = -self.ray_direction
-
-            # Ray-sphere intersection (centered at origin)
-            # Solve: ||origin + t*direction||^2 = inner_radius^2
-            a = np.dot(direction, direction)
-            b = 2 * np.dot(origin, direction)
-            c = np.dot(origin, origin) - inner_radius**2
-
-            discriminant = b**2 - 4*a*c
-            
-            if discriminant >= 0:
-                sqrt_disc = np.sqrt(discriminant)
-                t1 = (-b - sqrt_disc) / (2 * a)
-                t2 = (-b + sqrt_disc) / (2 * a)
-
-                # Choose the smallest *positive* t
-                t = None
-                if t1 > 0 and t2 > 0:
-                    t = min(t1, t2)
-                elif t1 > 0:
-                    t = t1
-                elif t2 > 0:
-                    t = t2
-                print(t)
-                if t is not None:
-                    intersection = origin + t * direction
-                    print(discriminant)
-                    # Draw small red sphere at intersection
-                    glPushMatrix()
-                    glColor3f(1.0, 1.0, 1.0)  # white marker
-                    glTranslatef(intersection[0], intersection[1], intersection[2])
-                    quad = gluNewQuadric()
-                    gluSphere(quad, 0.02, 10, 10)
-                    glPopMatrix()
 
         glPushMatrix()
         #rotate sphere only

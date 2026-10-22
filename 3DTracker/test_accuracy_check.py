@@ -25,6 +25,18 @@ class AccuracyTests(unittest.TestCase):
         self.assertEqual(len(check.rows),5)
         self.assertFalse(any(np.allclose(t,[.5,.5]) for t in CHECK_TARGETS))
 
+    def test_missing_prediction_does_not_block_capturing_or_advancing_targets(self):
+        check=AccuracyCheck([0,0,1000,500],100.)
+        now=100.
+        while not check.done and now<110:
+            now+=1/30
+            check.observe(np.asarray(check.target)*.1,None,now,now)
+            check.tick(now)
+        self.assertTrue(check.done)
+        self.assertEqual(check.status,'incomplete')
+        self.assertTrue(all(r['captured_samples']>=6 and r['samples']==0 for r in check.rows))
+        self.assertIsNone(check.state(now)['mean_error_points'])
+
     def test_off_screen_predictions_are_not_clipped(self):
         check=self.run_check((1,0))
         self.assertAlmostEqual(check.state(140.)['mean_error_points'],1000)

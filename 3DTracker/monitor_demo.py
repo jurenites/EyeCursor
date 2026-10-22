@@ -122,7 +122,7 @@ def usable(result, threshold=MIN_CONFIDENCE):
 def render_diagnostic_frame(frame, result, eye_region=None, threshold=MIN_CONFIDENCE, display_result=None, display_accepted=None, hybrid=False, eye_model_ready=False):
     """Show the detector's candidate and model direction on the raw eye image."""
     # Text and confidence are presented by the UI outside this image.
-    result = display_result or result
+    result = (result or {}).get("display_hold") or display_result or result
     image = tracker.crop_to_aspect_ratio(frame).copy()
     height, width = image.shape[:2]
     accepted = usable(result, threshold) if display_accepted is None else display_accepted
@@ -200,7 +200,20 @@ class Calibration:
         self.head_camera = None
         self.eye_camera_id = None
         self.eye_cameras = None
+        self.gaze_eye_mode = 'both'
         self.last_reported_phase = None
+
+    def set_gaze_eye_mode(self, mode):
+        if mode not in ('both','left','right'):raise ValueError('Choose both, left, or right')
+        with self.lock:
+            flow=self.onboarding
+            if flow and (flow.phase not in ('idle','complete','paused') or flow.cursor_calibration.active):
+                raise ValueError('Finish or stop calibration before changing cursor eyes')
+            self.gaze_eye_mode=mode
+            self.screen_motion.reset();self.gesture.reset();self.click_event=None
+            if flow:
+                flow.accuracy_check=None
+                flow.audit.append('gaze_eye_mode',time.monotonic(),mode=mode)
 
     def configure_eye_cameras(self, settings):
         if self.eye_cameras is None:
@@ -240,7 +253,8 @@ class Calibration:
             self.screen_motion.reset()
             return
         result = self.latest['result']
-        if not self.usable(result) and self.last_display is not self.latest:
+        eye_predictions=self.onboarding.eye_predictions() if getattr(self.onboarding,'hybrid',False) else {}
+        if not eye_predictions and not self.usable(result) and self.last_display is not self.latest:
             self.screen_motion.interrupt_confirmation()
             return
         feature = self.feature(result)
@@ -261,7 +275,8 @@ class Calibration:
         context = (self.source, self.eye_camera_id, id(self.onboarding),
                    id(mapping) if self.onboarding else id(self.matrix),
                    tuple(tuple(v) for v in displays))
-        self.screen_motion.update(desktop, viewport, self.latest['time'], context)
+        stamp=max((p['captured_at'] for p in eye_predictions.values()),default=self.latest['time'])
+        self.screen_motion.update(desktop, viewport, stamp, context)
 
     def set_detection_threshold(self, value):
         if type(value) not in (int, float) or not math.isfinite(value) or not .2 <= value <= .95:
@@ -350,6 +365,9 @@ class Calibration:
     def add_frame(self, result):
         now = time.monotonic()
         with self.lock:
+            if self.eye_cameras and hasattr(self.eye_cameras,'remember_observation'):
+                sample=getattr(self.eye_cameras,'frame_sample',None)
+                if sample:self.eye_cameras.remember_observation(sample['context'][0],sample,result,self.detection_threshold)
             self.frame_times.append(now)
             self.latest = {"time": now, "result": result}
             candidate = bool(result and result.get("pupil_ellipse") and result.get("gaze_direction"))
@@ -513,13 +531,14 @@ class Calibration:
             result = latest["result"] if latest else None
             fresh = bool(latest and time.monotonic() - latest["time"] < 0.5)
             valid = bool(fresh and self.usable(result))
+            eye_predictions=self.onboarding.eye_predictions() if getattr(self.onboarding,"hybrid",False) else {}
             calibrated = self.matrix is not None and (not self.native or self.native["phase"] == "complete")
             mapped = self.map_gaze(result["gaze_direction"][:2]) if valid and calibrated else None
             desktop = self.desktop_point(mapped)
             if self.onboarding:
                 calibrated = (self.onboarding.has_screen_mapping if getattr(self.onboarding,"hybrid",False)
                               else self.onboarding.phase == "complete")
-                desktop = self.onboarding.desktop_point(self.feature(result)) if valid and calibrated else None
+                desktop = self.onboarding.desktop_point(self.feature(result)) if calibrated and (valid or eye_predictions) else None
                 mapped = None
                 if desktop:
                     for display in self.onboarding.displays:
@@ -595,7 +614,7 @@ class Calibration:
                     action = 'Continue the step in diagnostics.' if getattr(self.onboarding, 'hybrid', False) else 'Choose Restart calibration.'
                     cursor_message = ('Calibration incomplete · ' + reason + '. ' + action)
                 else:
-                    cursor_message = 'Calibration in progress' if phase in ('fitting','head','screen','verify') else 'Waiting for calibration'
+                    cursor_message = 'Calibration in progress' if phase in ('fitting','head','screen','motion','verify','refine') else 'Waiting for calibration'
             elif not fresh:
                 cursor_message = 'Calibration complete · Waiting for the eye camera'
             elif head_state and not head_state['face_visible']:
@@ -609,15 +628,24 @@ class Calibration:
                 cursor_message = 'Calibration complete · Gaze outside the calibrated range. Return your head toward its calibration position.'
             else:
                 cursor_message = 'Eye cursor active' if self.desktop_cursor else 'Calibration complete · Desktop cursor disabled'
+            raw_eyes,binocular=(self.onboarding.binocular_estimate() if getattr(self.onboarding,'hybrid',False)
+                                else ({},{'status':'unavailable'}))
+            if binocular['status'] in ('disagreement','unsynchronized'):
+                cursor_message='Binocular estimate uncertain · Align with cursor'
             return {
+                "raw_eye_predictions":raw_eyes,
+                "binocular_status":binocular['status'],
+                "binocular_disagreement":binocular.get('disagreement'),
                 "source": self.source,
                 "eye_camera_id": self.eye_camera_id,
                 "eye_cameras": self.eye_cameras.status() if self.eye_cameras else None,
+                "eye_predictions": eye_predictions,
+                "gaze_eye_mode": self.gaze_eye_mode,
                 "mode": "hybrid" if self.head_camera else "ir",
                 "head_camera": head_state,
                 "camera_connected": fresh,
                 "valid": valid,
-                "display_valid": bool(desktop is not None and (valid or bridged)),
+                "display_valid": bool(desktop is not None and (valid or bridged or eye_predictions)),
                 "display_bridged": bridged,
                 "detection_threshold": self.detection_threshold,
                 "confidence": round(result.get("confidence", 0), 3) if fresh and result else 0,
@@ -804,10 +832,10 @@ def make_handler(calibration):
                 self.respond(404, {"error": "Not found"})
 
         def do_POST(self):
-            if self.path not in ("/capture", "/reset", "/calibration/start", "/blink-click", "/eye-region", "/eye-cameras",
+            if self.path not in ("/capture", "/reset", "/calibration/start", "/blink-click", "/eye-region", "/eye-cameras", "/gaze-eyes",
                                  "/eye-model/start", "/eye-model/freeze", "/onboarding/displays",
                                  "/onboarding/start", "/onboarding/retry", "/onboarding/stop", "/onboarding/cancel", "/detection-threshold",
-                                 "/onboarding/cursor-start", "/onboarding/cursor-sample", "/onboarding/cursor-finish", "/onboarding/head-refine", "/onboarding/preview-start", "/onboarding/accuracy-start"):
+                                 "/onboarding/cursor-start", "/onboarding/cursor-sample", "/onboarding/cursor-finish", "/onboarding/head-refine", "/onboarding/preview-start", "/onboarding/accuracy-start", "/onboarding/learn-dots"):
                 self.respond(404, {"error": "Not found"})
                 return
             try:
@@ -824,7 +852,8 @@ def make_handler(calibration):
                         if self.path == "/onboarding/displays":
                             calibration.onboarding.configure(body.get("displays"))
                         elif self.path == "/onboarding/start":
-                            calibration.onboarding.arm()
+                            if getattr(calibration.onboarding,'hybrid',False):calibration.onboarding.arm(start=True)
+                            else:calibration.onboarding.arm()
                         elif self.path == "/onboarding/stop":
                             if getattr(calibration.onboarding, 'hybrid', False):
                                 calibration.onboarding.stop_step()
@@ -837,6 +866,9 @@ def make_handler(calibration):
                             if not getattr(calibration.onboarding,'hybrid',False):
                                 raise ValueError('Preview alignment requires IR + webcam tracking')
                             calibration.onboarding.start_preview_alignment(body.get('target'))
+                        elif self.path == '/onboarding/learn-dots':
+                            if not getattr(calibration.onboarding,'hybrid',False):raise ValueError('Dot learning requires IR + webcam tracking')
+                            calibration.onboarding.start_dot_learning()
                         elif self.path == '/onboarding/accuracy-start':
                             if not getattr(calibration.onboarding,'hybrid',False):
                                 raise ValueError('Accuracy checking requires IR + webcam tracking')
@@ -856,6 +888,9 @@ def make_handler(calibration):
                         result = calibration.state()
                 elif calibration.onboarding and self.path in ("/eye-model/start", "/eye-model/freeze", "/calibration/start", "/capture"):
                     raise ValueError("Eye and monitor calibration now advance automatically. Use Restart calibration to begin again.")
+                elif self.path == "/gaze-eyes":
+                    calibration.set_gaze_eye_mode(body.get('mode'))
+                    result = calibration.state()
                 elif self.path == "/eye-cameras":
                     calibration.configure_eye_cameras(body)
                     result = calibration.state()

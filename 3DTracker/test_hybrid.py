@@ -174,6 +174,9 @@ class FakeHead:
 
 class HybridFlowTests(unittest.TestCase):
     def setUp(self):
+        from test_continuous_calibration import ImmediateExecutor
+        executor=patch('continuous_calibration.ThreadPoolExecutor',side_effect=lambda **kw:ImmediateExecutor())
+        executor.start();self.addCleanup(executor.stop)
         self.now=100.
         clock=patch('monitor_demo.time.monotonic',side_effect=lambda:self.now);clock.start();self.addCleanup(clock.stop)
         self.head=FakeHead()
@@ -181,6 +184,7 @@ class HybridFlowTests(unittest.TestCase):
         self.flow=HybridOnboarding(self.c,self.head,clock=lambda:self.now)
         self.c.onboarding=self.flow;self.c.head_camera=self.head
         self.flow.configure([{'id':'laptop','viewport':[-1440,100,1440,900]}])
+        self.flow.arm(start=True)  # Existing flow fixtures explicitly begin onboarding.
         self.last_result=None
 
     def feed(self,target=(.5,.5),head=None,confidence=.9):
@@ -198,6 +202,98 @@ class HybridFlowTests(unittest.TestCase):
         self.assertEqual(self.flow.phase,'head')
         self.now+=.6
 
+    def test_guided_five_targets_fit_both_eyes_when_right_settles_later(self):
+        from test_binocular_calibration import observation
+        self.start_head();current={}
+        rig=SimpleNamespace(config={s:{'device_id':s} for s in ('left','right')},
+            observations_at=lambda *args,**kwargs:current,
+            context=lambda:('left','left',180),status=lambda:{})
+        self.c.eye_cameras=rig
+        visited=set()
+        try:
+            for _ in range(1000):
+                if self.flow.phase not in ('head','screen'):break
+                index=self.flow.screen_circle.index+1 if self.flow.phase=='screen' else 0
+                visited.add(index)
+                started=self.flow.screen_circle.corner_started_at if index else self.flow.head_started
+                now=self.now+1/30
+                target=self.flow.screen_circle.target(now) if index else TARGETS[0]
+                current={'left':observation('left',target,now)}
+                if now-started>2.5:current['right']=observation('right',target,now)
+                self.feed(target)
+            self.assertEqual(visited,set(range(5)))
+            self.assertEqual(self.flow.phase,'motion',self.flow.message)
+            self.assertIn('right',self.flow.binocular.maps)
+            for target in TARGETS:
+                np.testing.assert_allclose(self.flow.binocular.predict('right',observation('right',target,self.now)),target,atol=1e-8)
+        finally:self.c.eye_cameras=None
+
+    def test_companion_head_capture_continues_when_primary_pupil_is_rejected(self):
+        self.enter_guided_motion()
+        from test_binocular_calibration import observation
+        now=self.now+1.
+        other=observation('right',[.5,.5],now)
+        self.flow.binocular.identity('right',other['identity'])
+        self.flow.binocular.maps['right']=self.flow.mapping
+        self.flow.binocular.seeds['right']=self.flow.geometry_seeds()
+        self.c.eye_cameras=SimpleNamespace(observations_at=lambda *args,**kwargs:{'right':other},
+                                          context=lambda:('left','left',180))
+        try:
+            self.flow.refine_head(None,now,now)
+            companion=self.flow.binocular.practices['right']
+            self.assertEqual(companion.total_samples,1)
+            self.assertEqual(self.flow.head_refinement.total_samples,0)
+            self.assertEqual(companion.samples[0][0],now)
+        finally:self.c.eye_cameras=None
+
+    def test_guided_shared_target_waits_for_second_eye_without_separate_pass(self):
+        from test_binocular_calibration import observation
+        from quick_calibration import QuickCalibration
+        current={}
+        self.c.eye_cameras=SimpleNamespace(
+            config={s:{'device_id':s} for s in ('left','right')},
+            observations_at=lambda *args,**kwargs:current)
+        self.flow.phase='screen';self.flow.screen_circle=QuickCalibration([.5,.5],10.)
+        target=TARGETS[1]
+        for i in range(12):
+            now=11.+i*.04;current={'left':observation('left',target,now)}
+            ready=self.flow.collect_shared_target(now)
+        self.assertFalse(ready)
+        for i in range(12):
+            now=12.5+i*.04;current={'right':observation('right',target,now)}
+            ready=self.flow.collect_shared_target(now)
+        self.assertTrue(ready)
+        self.assertEqual(set(self.flow.binocular.onboarding_captures[1].completed),{'left','right'})
+        self.assertEqual(self.flow.screen_circle.index,0)
+        # Missing hardware remains bounded, rather than trapping the wearer.
+        self.flow.screen_circle.index=1;self.flow.screen_circle.corner_started_at=14.
+        current={}
+        self.assertFalse(self.flow.collect_shared_target(15.))
+        self.assertTrue(self.flow.collect_shared_target(22.))
+        self.c.eye_cameras=None
+
+    def test_launch_and_display_registration_wait_for_an_explicit_start(self):
+        self.flow=HybridOnboarding(self.c,self.head,clock=lambda:self.now)
+        self.c.onboarding=self.flow
+        self.flow.configure([{'id':'laptop','viewport':[-1440,100,1440,900]}])
+        for _ in range(300):self.feed()
+        self.assertEqual(self.flow.phase,'idle')
+        self.assertIsNone(self.flow.started_at)
+        self.assertEqual(self.flow.pairs,[])
+        self.assertEqual(self.flow.calibration_rays,[])
+        self.assertEqual(self.c.eye_model.phase,'uncalibrated')
+        self.flow.retry_step()
+        self.assertEqual(self.flow.phase,'waiting')
+        self.start_head()
+        self.assertEqual(self.flow.phase,'head')
+
+    def test_manual_cursor_calibration_can_start_from_idle(self):
+        self.flow.arm()
+        self.flow.start_cursor_calibration()
+        self.assertEqual(self.flow.phase,'cursor')
+        self.assertEqual(self.c.eye_model.phase,'collecting')
+        self.cursor_center()
+
     def test_countdown_follows_real_deadlines_and_stops_when_inactive(self):
         self.assertIsNone(self.flow.state()['remaining_seconds'])
         self.start_head()
@@ -213,7 +309,7 @@ class HybridFlowTests(unittest.TestCase):
         self.assertEqual(state['stopped_stage'],'head')
         self.assertIsNone(state['remaining_seconds'])
         self.assertIsNone(state['step_remaining_seconds'])
-        self.flow.arm()
+        self.flow.arm(start=True)
         self.assertIsNone(self.flow.state()['remaining_seconds'])
 
     def finish(self):
@@ -224,13 +320,17 @@ class HybridFlowTests(unittest.TestCase):
         self.assertEqual(self.flow.phase,'screen',self.flow.message)
         self.finish_circle()
 
-    def finish_circle(self):
+    def finish_circle(self,complete_guided=True):
         started=self.flow.screen_circle.started_at
         for _ in range(400):
             if self.flow.phase!='screen':break
             self.feed(circular_target(self.now+1/30-started-.1))
-        self.assertEqual(self.flow.phase,'verify',self.flow.message)
+        self.assertEqual(self.flow.phase,'motion',self.flow.message)
         self.assertLessEqual(self.now-started,FIRST_PAIR_SECONDS+4)
+        if not complete_guided:return
+        self.now+=self.flow.GUIDED_MOTION_SECONDS
+        self.flow.tick(self.now)
+        self.assertEqual(self.flow.phase,'verify',self.flow.message)
         self.finish_accuracy()
 
     def finish_accuracy(self):
@@ -241,6 +341,139 @@ class HybridFlowTests(unittest.TestCase):
         self.assertEqual(self.flow.phase,'complete',self.flow.message)
         self.assertEqual(self.flow.accuracy_check.status,'complete')
         self.assertIs(self.flow.mapping,mapping)
+
+    def enter_guided_motion(self):
+        self.start_head()
+        for _ in range(450):
+            self.feed()
+            if self.flow.phase=='screen':break
+        self.finish_circle(complete_guided=False)
+
+    def test_guided_sequence_collects_without_mouse_posts_and_advances_on_deadline(self):
+        self.enter_guided_motion();mapping=self.flow.mapping
+        self.assertFalse(self.flow.has_screen_mapping)
+        state=self.flow.state()
+        self.assertEqual(state['target'],[.5,.5])
+        self.assertAlmostEqual(state['remaining_seconds'],24.)
+        for _ in range(50):self.feed()
+        self.assertGreater(self.flow.head_refinement.total_samples,0)
+        count=self.flow.head_refinement.total_samples
+        self.flow.cursor_sample([.8,.2])
+        self.assertEqual(self.flow.head_refinement.total_samples,count,'No duplicate mouse-post training')
+        self.now=self.flow.guided_motion_started+24
+        self.flow.tick()
+        self.assertEqual(self.flow.phase,'verify')
+        self.assertEqual(self.flow.guided_motion_outcome,'previous_fit_kept')
+        self.assertIs(self.flow.mapping,mapping)
+        self.assertFalse(self.flow.cursor_calibration.active)
+        self.finish_accuracy()
+        self.assertIn('five-dot fit was kept',self.flow.message)
+
+    def test_guided_motion_stop_retry_keeps_anchors_and_does_not_auto_resume(self):
+        self.enter_guided_motion();mapping=self.flow.mapping;run=self.flow.head_refinement
+        self.flow.stop_step();self.now+=100;self.flow.tick()
+        self.assertEqual(self.flow.phase,'paused')
+        self.assertEqual(self.flow.stopped_stage,'motion')
+        self.assertIs(self.flow.mapping,mapping)
+        self.assertFalse(self.flow.cursor_calibration.active)
+        self.flow.retry_step()
+        self.assertEqual(self.flow.phase,'motion')
+        self.assertIs(self.flow.head_refinement,run)
+        self.assertAlmostEqual(self.flow.state()['remaining_seconds'],24.)
+        self.now+=24;self.flow.tick()
+        self.assertEqual(self.flow.phase,'verify')
+
+    def test_guided_motion_advances_early_only_after_a_checked_correction(self):
+        self.enter_guided_motion();run=self.flow.head_refinement
+        run.result=self.flow.mapping;run.applied=True;run.revision=1
+        run.checked_motion={'rotation':True,'translation':True}
+        self.now=self.flow.guided_motion_started+11
+        self.flow.tick();self.assertEqual(self.flow.phase,'motion')
+        self.now+=1;self.flow.tick()
+        self.assertEqual(self.flow.phase,'verify')
+        self.assertEqual(self.flow.guided_motion_outcome,'applied')
+
+    def test_guided_deadline_allows_a_late_candidates_fresh_check_to_finish(self):
+        self.enter_guided_motion();run=self.flow.head_refinement
+        run.phase='validate';run.validation_started=self.flow.guided_motion_started+23
+        self.now=self.flow.guided_motion_started+24
+        self.flow.tick()
+        self.assertEqual(self.flow.phase,'motion')
+        self.assertAlmostEqual(self.flow.state()['remaining_seconds'],3.)
+        self.now+=3;self.flow.tick()
+        self.assertEqual(self.flow.phase,'verify')
+        self.assertEqual(run.check_failures,1,'The check ran rather than being cancelled')
+
+    def test_finish_cursor_route_stops_guided_motion_without_stranding_it(self):
+        self.enter_guided_motion()
+        self.flow.finish_cursor_calibration()
+        self.assertEqual(self.flow.phase,'paused')
+        self.assertEqual(self.flow.stopped_stage,'motion')
+        self.now+=30;self.flow.tick()
+        self.assertEqual(self.flow.phase,'paused')
+
+    def test_missing_head_seeds_preserves_screen_fit_and_checks_accuracy(self):
+        self.start_head()
+        for _ in range(450):
+            self.feed()
+            if self.flow.phase=='screen':break
+        with patch.object(self.flow,'geometry_seeds',return_value=[]):
+            started=self.flow.screen_circle.started_at
+            for _ in range(600):
+                self.feed(circular_target(self.now+1/30-started-.1))
+                if self.flow.phase!='screen':break
+        self.assertEqual(self.flow.phase,'verify')
+        self.assertIsNotNone(self.flow.mapping)
+        self.assertEqual(self.flow.guided_motion_outcome,'previous_fit_kept')
+
+    def test_dot_learning_trusts_targets_and_applies_only_after_the_pass(self):
+        self.finish();old=self.flow.mapping
+        self.flow.start_dot_learning()
+        estimate=self.flow.estimate_uv
+        def guarded_estimate(feature):
+            self.assertNotEqual(self.flow.phase,'refine','No gaze inference during known-target collection')
+            return estimate(feature)
+        with patch.object(self.flow,'estimate_uv',side_effect=guarded_estimate):
+            for _ in range(500):
+                if self.flow.phase!='refine':break
+                self.assertIs(self.flow.mapping,old)
+                self.assertFalse(self.flow.has_prediction_mapping)
+                self.feed(self.flow.dot_learning.target)
+        self.assertEqual(self.flow.phase,'complete')
+        self.assertIsNot(self.flow.mapping,old)
+        self.assertEqual(len(self.flow.mapping.anchors),5)
+        self.assertTrue(all(len(row['eyes']['right'])>=6 for row in self.flow.dot_learning.rows))
+
+    def test_dot_learning_fits_both_eyes_from_known_targets_even_with_a_wrong_old_map(self):
+        self.finish()
+        current={}
+        rig=SimpleNamespace(config={'left':{'device_id':'L'},'right':{'device_id':'R'}},
+            context=lambda:('right','R',0),observations_at=lambda stamp:current)
+        self.c.eye_cameras=rig
+        self.flow.start_dot_learning()
+        for _ in range(500):
+            if self.flow.phase!='refine':break
+            self.now+=1/30;target=np.asarray(self.flow.dot_learning.target)
+            current.clear()
+            current.update({side:{'identity':(side,0,1),'time':self.now,'head':BASE.tolist(),
+                                  'eye':(pupil(target,BASE)+[.035,-.025] if side=='right' else [.65,.6]-target*[.2,.15]).tolist(),
+                                  'confidence':.9} for side in ('left','right')})
+            with patch.object(self.flow,'estimate_uv',side_effect=AssertionError('Do not predict while learning')):
+                self.flow.update_dot_learning({},self.now)
+        self.assertEqual(self.flow.phase,'complete')
+        self.assertIn('left',self.flow.binocular.maps)
+        for target in map(np.asarray,TARGETS):
+            right=pupil(target,BASE)+[.035,-.025]
+            np.testing.assert_allclose(self.flow.estimate_uv([*right,*BASE]),target,atol=1e-6)
+            left={'identity':('left',0,1),'eye':([.65,.6]-target*[.2,.15]).tolist(),'head':BASE.tolist()}
+            np.testing.assert_allclose(self.flow.binocular.predict('left',left),target,atol=1e-6)
+
+    def test_stopping_dot_learning_keeps_mapping_and_retry_starts_a_new_pass(self):
+        self.finish();old=self.flow.mapping;self.flow.start_dot_learning()
+        self.flow.stop_step();self.now+=100;self.flow.tick()
+        self.assertEqual(self.flow.phase,'paused');self.assertIs(self.flow.mapping,old)
+        self.flow.retry_step()
+        self.assertEqual(self.flow.phase,'refine');self.assertEqual(self.flow.dot_learning.index,0)
 
     def test_accuracy_timeout_without_camera_frames_keeps_the_mapping(self):
         self.finish()
@@ -262,13 +495,16 @@ class HybridFlowTests(unittest.TestCase):
         self.flow.stop_step()
         self.assertEqual(self.flow.accuracy_check.status,'incomplete')
         self.assertIs(self.flow.mapping,mapping)
-        self.flow.start_accuracy_check()
+        self.now+=100;self.flow.tick()
+        self.assertEqual(self.flow.phase,'paused')
+        self.assertEqual(self.flow.stopped_stage,'verify')
+        self.flow.retry_step()
         self.assertEqual(self.flow.accuracy_check.rows,[])
         self.finish_accuracy()
 
     def test_single_flow_finishes_and_head_turn_keeps_cursor_at_gaze_target(self):
         self.finish()
-        self.assertLess(self.now-100,20)
+        self.assertLess(self.now-100,50)
         # Screen feedback intentionally settles after a newly confirmed fixation.
         for _ in range(20):
             self.feed((.75,.25))
@@ -304,7 +540,7 @@ class HybridFlowTests(unittest.TestCase):
 
     def test_stop_waiting_or_head_cannot_auto_resume_even_after_reconnect(self):
         for phase in ('waiting','head'):
-            self.flow.arm()
+            self.flow.arm(start=True)
             if phase=='head':self.start_head()
             self.flow.stop_step()
             for _ in range(100):self.feed()
@@ -389,7 +625,7 @@ class HybridFlowTests(unittest.TestCase):
         self.finish()
         self.flow.phase='screen';self.flow.mapping=None
         self.head.epoch+=1
-        self.assertEqual(self.flow.state()['phase'],'waiting')
+        self.assertEqual(self.flow.state()['phase'],'idle')
         self.assertIsNone(self.flow.mapping)
         self.assertIsNone(self.flow.screen_circle)
 
@@ -439,10 +675,11 @@ class HybridFlowTests(unittest.TestCase):
             self.assertIs(self.flow.head_refinement,practice)
             for _ in range(450):
                 self.feed(head=moving_head(self.now-started));self.flow.cursor_sample([.1,.9])
-                if practice.done:break
+                if practice.applied:break
                 self.assertIs(self.flow.mapping,original)
             self.assertTrue(practice.applied,practice.message)
-            self.assertFalse(self.flow.cursor_calibration.active)
+            self.assertTrue(self.flow.cursor_calibration.active)
+            self.flow.finish_cursor_calibration()
             self.assertEqual(self.flow.state()['head_correction_status'],'geometric')
             self.assertIsNotNone(self.flow.state()['geometry_model'])
             self.assertTrue(any(r['source']=='geometry-check' for r in self.flow.calibration_rays))
@@ -464,16 +701,17 @@ class HybridFlowTests(unittest.TestCase):
             self.assertFalse(any(r['source']=='onboarding' for r in self.flow.calibration_rays))
             self.assertGreaterEqual(len(self.flow.geometry_seeds()),5)
             self.flow.start_head_refinement();start=self.now
-            for _ in range(470):
+            for _ in range(800):
                 t=self.now-start
                 head=PHYSICAL_BASE.copy()
-                if t<5 or 10<=t<12.5:head[0]+=.14*np.sin(t*3.)
-                else:head[3]+=.024*np.sin(t*3.)
+                head[0]+=.14*np.sin(t*2.)
+                head[3]+=.024*np.sin(t*3.1)
                 self.feed(head=head);self.flow.cursor_sample([.5,.5])
-                if self.flow.head_refinement.done:break
+                if self.flow.head_refinement.applied:break
             run=self.flow.head_refinement
             self.assertTrue(run.applied,run.message)
             self.assertTrue(all(run.checked_motion.values()),run.state(self.now))
+            self.flow.finish_cursor_calibration()
             for delta in ([.10,0,0,0,0,0],[0,0,0,.018,0,0],[.08,0,0,-.012,0,0]):
                 head=PHYSICAL_BASE+delta
                 self.feed([.65,.4],head)
@@ -486,8 +724,10 @@ class HybridFlowTests(unittest.TestCase):
         self.flow.start_head_refinement()
         for _ in range(500):
             self.feed(confidence=.1);self.flow.cursor_sample([.5,.5])
-        self.assertTrue(self.flow.head_refinement.done)
+        self.assertFalse(self.flow.head_refinement.done)
         self.assertFalse(self.flow.head_refinement.applied)
+        self.assertTrue(self.flow.cursor_calibration.active)
+        self.flow.finish_cursor_calibration()
         self.assertFalse(self.flow.cursor_calibration.active)
         self.assertIs(self.flow.mapping,previous)
         self.assertTrue(self.flow.has_screen_mapping)
@@ -498,6 +738,33 @@ class HybridFlowTests(unittest.TestCase):
             self.feed();self.flow.cursor_sample([.5,.5])
         self.assertEqual(self.flow.cursor_calibration.stage,'positions',self.flow.cursor_calibration.message)
         self.assertEqual(self.flow.cursor_head_fit.mode,'steady')
+
+    def test_continuous_capture_rejects_reflection_shape_without_erasing_the_map(self):
+        self.finish();original=self.flow.mapping;self.flow.start_head_refinement()
+        self.feed()
+        self.last_result['pupil_ellipse'].update(axes=[30,80],angle_degrees=0)
+        self.last_result.update(iris_ellipse={'axes':[100,105],'angle_degrees':0},iris_support=.9)
+        self.flow.cursor_sample([.5,.5])
+        self.assertFalse(self.flow.cursor_calibration.accepted)
+        self.assertEqual(self.flow.head_refinement.total_samples,0)
+        self.assertIs(self.flow.mapping,original)
+        self.feed();self.flow.cursor_sample([.5,.5])
+        self.assertTrue(self.flow.cursor_calibration.accepted)
+        self.assertEqual(self.flow.head_refinement.total_samples,1)
+        self.flow.finish_cursor_calibration()
+
+    def test_continuous_evidence_is_journaled_beyond_the_live_preview_limit(self):
+        with tempfile.TemporaryDirectory() as folder:
+            self.flow.reference_log=Path(folder)/'measurements.jsonl'
+            self.flow.record_reference([.5,.5],BASE,[.5,.5],'onboarding')
+            for i in range(4200):
+                self.flow.record_reference([.5,.5],BASE,[.5,.5],'geometry-training',stamp=100+i/30)
+            self.assertLessEqual(len(self.flow.calibration_rays),3901)
+            self.assertEqual(self.flow.calibration_rays[0]['source'],'onboarding')
+            self.assertEqual(len(self.flow.reference_log.read_text().splitlines()),4201)
+            state=self.flow.state()
+            self.assertEqual(state['calibration_measurement_count'],4201)
+            self.assertEqual(len(state['calibration_rays']),121)
 
     def test_cursor_alignment_keeps_old_map_until_explicit_finish(self):
         from test_cursor_calibration import TARGETS as MOUSE_TARGETS
@@ -567,7 +834,16 @@ class HybridFlowTests(unittest.TestCase):
         self.assertTrue(np.allclose(self.flow.desktop_point(feature),[x+w-8,y+8]))
         self.assertIsNone(self.flow.desktop_point(None))
 
-    def test_external_screen_uses_laptop_map_and_topology_changes_preserve_calibration(self):
+    def test_validation_can_evaluate_saved_maps_without_enabling_the_cursor(self):
+        self.finish()
+        feature=self.flow.feature(self.last_result)
+        before=self.flow.estimate_uv(feature)
+        self.flow.start_accuracy_check()
+        self.assertFalse(self.flow.has_screen_mapping)
+        self.assertTrue(self.flow.has_prediction_mapping)
+        np.testing.assert_allclose(self.flow.estimate_uv(feature),before)
+
+    def test_external_screen_does_not_receive_laptop_extrapolation_and_topology_preserves_calibration(self):
         self.finish()
         mapping = self.flow.mapping
         laptop = self.flow.displays[0]
@@ -575,7 +851,7 @@ class HybridFlowTests(unittest.TestCase):
         self.assertIs(self.flow.mapping,mapping)
         self.assertEqual(self.flow.phase,'complete')
         self.feed([1.3,.5])
-        self.assertTrue(np.allclose(self.flow.desktop_point(self.flow.feature(self.last_result)),[432,550]))
+        self.assertTrue(np.allclose(self.flow.desktop_point(self.flow.feature(self.last_result)),[-8,550]))
         self.flow.configure([laptop])
         self.assertIs(self.flow.mapping,mapping)
         self.assertTrue(np.allclose(self.flow.desktop_point(self.flow.feature(self.last_result)),[-8,550]))
@@ -602,7 +878,7 @@ class HybridFlowTests(unittest.TestCase):
     def test_each_accepted_onboarding_frame_is_retained_and_journaled_across_reset(self):
         with tempfile.TemporaryDirectory() as folder:
             self.flow.diagnostic_path=Path(folder)/'head.json'
-            self.flow.arm()
+            self.flow.arm(start=True)
             self.finish()
             samples=self.flow.calibration_rays
             self.assertGreater(len(samples),80, 'Do not discard all but the last 80 observations')
@@ -614,7 +890,7 @@ class HybridFlowTests(unittest.TestCase):
             self.assertEqual([json.loads(line) for line in journal.read_text().splitlines()],samples)
             old_session=self.flow.state()['calibration_session_id']
             old_contents=journal.read_text()
-            self.flow.arm()
+            self.flow.arm(start=True)
             self.assertNotEqual(self.flow.state()['calibration_session_id'],old_session)
             self.assertEqual(journal.read_text(),old_contents)
             self.assertEqual(self.flow.calibration_rays,[])
@@ -706,7 +982,7 @@ class HybridFlowTests(unittest.TestCase):
     def test_manual_cursor_button_can_replace_running_or_failed_guided_steps(self):
         from test_cursor_calibration import TARGETS as MOUSE_TARGETS
         for mode in ('fresh','running','failed'):
-            self.flow.arm()
+            self.flow.arm(start=True)
             if mode!='fresh':
                 self.start_head()
                 while self.flow.phase=='head':self.feed()
@@ -725,7 +1001,7 @@ class HybridFlowTests(unittest.TestCase):
     def test_manual_log_records_initial_state_rejections_measurements_and_model(self):
         from test_cursor_calibration import TARGETS as MOUSE_TARGETS
         with tempfile.TemporaryDirectory() as folder:
-            self.flow.diagnostic_path=Path(folder)/'head.json';self.flow.arm()
+            self.flow.diagnostic_path=Path(folder)/'head.json';self.flow.arm(start=True)
             self.flow.start_cursor_calibration()
             for _ in range(12):
                 self.feed(confidence=.1);self.flow.cursor_sample([.5,.5])
@@ -754,7 +1030,7 @@ class HybridFlowTests(unittest.TestCase):
             prediction=np.r_[MOUSE_TARGETS[0]*[.18,.14]+[.38,.35],1]@np.array(raw['coefficients'])
             self.assertTrue(np.isfinite(prediction).all())
             previous=self.flow.audit.path;contents=previous.read_text()
-            self.flow.arm();self.assertEqual(previous.read_text(),contents)
+            self.flow.arm(start=True);self.assertEqual(previous.read_text(),contents)
 
     def test_eye_geometry_collects_and_freezes_alongside_head_calibration(self):
         self.start_head()
@@ -922,7 +1198,7 @@ class HybridFlowTests(unittest.TestCase):
         self.finish()
         self.head.epoch+=1
         self.c.state()
-        self.assertEqual(self.flow.phase,'waiting')
+        self.assertEqual(self.flow.phase,'idle')
         self.assertIsNone(self.flow.mapping)
 
     def test_stale_mismatched_pose_and_duplicate_samples_cannot_calibrate(self):

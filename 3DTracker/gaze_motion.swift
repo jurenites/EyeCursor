@@ -119,6 +119,7 @@ struct GazeMotion {
     private var lossStarted: Double?
     private var lossOpacity = 1.0
     private var hasAppeared = false
+    private var responseTime = 0.07
     private(set) var opacity = 0.0
 
     mutating func reset() { self = GazeMotion() }
@@ -135,6 +136,9 @@ struct GazeMotion {
             velocity = .zero
             opacity = hasAppeared ? 0 : 1
             hasAppeared = true
+        }
+        if let current = position {
+            responseTime = hypot(point.x-current.x, point.y-current.y) > 12 ? 0.025 : 0.07
         }
         target = point
         lastTarget = time
@@ -153,7 +157,8 @@ struct GazeMotion {
     private mutating func follow(until time: Double) {
         guard let current = position else { return }
         let dt = time - lastTick
-        let omega = 1.0 / 0.07
+        guard dt > 0 else { return }
+        let omega = 1.0 / responseTime
         let decay = exp(-omega * dt)
         func axis(_ value: CGFloat, _ speed: CGFloat, _ goal: CGFloat) -> (CGFloat, CGFloat) {
             let offset = Double(value - goal)

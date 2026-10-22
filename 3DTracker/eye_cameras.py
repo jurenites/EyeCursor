@@ -8,13 +8,14 @@ import time
 
 import cv2
 from live_capture import ReconnectingCapture
+from isolated_capture import IsolatedCapture
 
 
 class EyeCameraRig:
     def __init__(self, enumerate_devices, path, opener=None, excluded_id=None, clock=time.monotonic):
         self.enumerate_devices = enumerate_devices
         self.path = Path(path)
-        self.opener = opener or (lambda index: cv2.VideoCapture(index, cv2.CAP_AVFOUNDATION))
+        self.opener = opener or IsolatedCapture
         self.excluded_id = excluded_id
         self.clock = clock
         self.lock = threading.RLock()
@@ -26,6 +27,7 @@ class EyeCameraRig:
                        'right': {'device_id': None, 'rotation': 0}}
         self.samples = {}
         self.tracking = {}
+        self.observation_history = {eye: deque(maxlen=600) for eye in ("left","right")}
         self.tracking_errors = {}
         self.revisions = {'left': 0, 'right': 0}
         self.tracking_times = {eye: deque(maxlen=60) for eye in ('left', 'right')}
@@ -173,11 +175,15 @@ class EyeCameraRig:
                     continue
                 try:
                     if capture is None:
-                        capture = ReconnectingCapture(lambda: self._open(eye, selected))
+                        capture = ReconnectingCapture(lambda: self._open(eye, selected),clock=self.clock,warmup_seconds=8.)
                     ok, frame = capture.read()
                     if ok:
-                        self._publish(eye, settings, frame, self.clock())
+                        self._publish(eye, settings, frame, capture.frame_time)
                     else:
+                        with self.lock:
+                            sample=self.samples.get(eye)
+                            if sample is None or self.clock()-sample['time']>=.5:
+                                self.errors[eye]='Reconnecting camera' if capture.reopened else 'Waiting for camera frames'
                         self.stop.wait(.02)
                 except Exception as error:
                     with self.lock:
@@ -220,6 +226,7 @@ class EyeCameraRig:
             return dict(sample) if sample and self.clock() - sample['time'] < .5 else None
 
     def publish_tracking(self, eye, sample, result, jpeg, threshold):
+        self.remember_observation(eye,sample,result,threshold)
         with self.lock:
             current = self.samples.get(eye)
             if (not current or current['context'] != sample['context']
@@ -236,6 +243,59 @@ class EyeCameraRig:
                                   'valid': valid, 'result': result}
             self.tracking_errors.pop(eye, None)
             self.tracking_times[eye].append(sample['time'])
+
+    def remember_observation(self, eye, sample, result, threshold):
+        """Numeric history for target captures committed after a one-second hold."""
+        if not sample or not result or not result.get('pupil_ellipse') or result.get('confidence',0)<threshold:return
+        head=result.get('head_pose') or {}
+        if not head.get('features') or abs(sample['time']-head.get('time',-1))>.12:return
+        from continuous_calibration import pupil_shape_rejection
+        if pupil_shape_rejection(result):return
+        import numpy as np
+        raw=np.array(result['pupil_ellipse']['center'])/[640,480]
+        features=np.asarray(head['features'])
+        if raw.shape!=(2,) or features.shape!=(6,) or not np.isfinite(np.r_[raw,features]).all():return
+        with self.lock:
+            if (sample['context'][1:]!=(self.config[eye]['device_id'],self.config[eye]['rotation'])
+                    or sample['revision']!=self.revisions[eye] or sample['session']!=self.sessions[eye]):return
+            identity=(sample['context'][1],sample['context'][2],sample['revision'],sample['session'],head.get('epoch'))
+            history=self.observation_history[eye]
+            if history and history[-1]['identity']!=identity:history.clear()
+            if history and sample['time']<=history[-1]['time']:return
+            history.append({'identity':identity,'time':sample['time'],'eye':raw.tolist(),
+                            'head':features.tolist(),'confidence':result['confidence']})
+
+    def observations_at(self, stamp, tolerance=.12):
+        with self.lock:
+            observations={}
+            for side,history in self.observation_history.items():
+                if not history:continue
+                sample=self.samples.get(side)
+                if not sample:continue
+                row=min(history,key=lambda row:abs(row['time']-stamp))
+                identity=row['identity']
+                if (abs(row['time']-stamp)<=tolerance and identity[:4]==
+                    (self.config[side]['device_id'],self.config[side]['rotation'],self.revisions[side],self.sessions[side])):
+                    observations[side]=dict(row)
+            return observations
+
+    def prediction_observations_at(self,stamp,tolerance=.15):
+        """Display-only raster holds never enter observations_at or fit history."""
+        observations=self.observations_at(stamp,tolerance)
+        with self.lock:
+            for side,tracked in self.tracking.items():
+                result=tracked.get('result') or {};held=result.get('display_hold')
+                sample=self.samples.get(side);head=result.get('head_pose') or {}
+                if not held or not sample or not head.get('features'):continue
+                if not (0<=stamp-tracked['time']<=tolerance and stamp<=held['held_until']):continue
+                if tracked['epoch']!=(sample['revision'],sample['session']):continue
+                if abs(tracked['time']-head.get('time',-1))>.12:continue
+                identity=(sample['context'][1],sample['context'][2],sample['revision'],sample['session'],head.get('epoch'))
+                observations[side]={'identity':identity,'time':tracked['time'],
+                    'eye':[held['pupil_ellipse']['center'][0]/640,held['pupil_ellipse']['center'][1]/480],
+                    'head':head['features'],'confidence':held['confidence'],
+                    'held':True,'measured_at':held['measured_at']}
+        return observations
 
     def jpeg(self, eye):
         with self.lock:
@@ -269,7 +329,7 @@ class EyeCameraRig:
                 if (tracking_fresh and tracked['valid'] and result.get('eye_model_estimated')
                         and finite(vector, 3) and sum(v*v for v in vector) > 1e-6
                         and finite(head, 6)):
-                    direction = {'vector': vector, 'head_features': head}
+                    direction = {'vector': vector, 'head_features': head, 'captured_at':tracked['time']}
                 eyes[eye] = {**self.config[eye], 'connected': connected, 'fps': fps,
                              'tracking_fps': tracking_fps,
                              'tracking': ('Pupil tracked' if tracked['valid'] else 'Searching for pupil') if tracking_fresh else 'Waiting for detection',

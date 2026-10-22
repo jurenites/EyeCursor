@@ -69,6 +69,7 @@ controller.applicationDidFinishLaunching(Notification(name: NSApplication.didFin
 precondition(controller.angleDebugger.contentView.window === controller.diagnosticWindow,
              "The scene and camera previews must share the diagnostics window")
 controller.showDiagnostics()
+controller.angleDebugger.rawDirections.state = .on
 controller.diagnosticWindow.contentView!.layoutSubtreeIfNeeded()
 precondition(controller.versionLabel.stringValue == controller.buildVersion)
 precondition(controller.versionMenu.title == "EyeCursor \(controller.buildVersion)")
@@ -141,7 +142,7 @@ let secondVideo = arrangedCameras.firstIndex(of: controller.secondaryEyePreview)
 precondition(firstVideo < secondVideo)
 precondition(!arrangedCameras[(firstVideo+1)..<secondVideo].contains { $0 is NSButton || $0 is NSSlider || $0 is NSStackView },
              "Eye previews must be adjacent apart from their headings and status readouts")
-precondition(arrangedCameras.firstIndex(of: controller.previewAlignButton)! > secondVideo)
+precondition(!arrangedCameras.contains(controller.previewAlignButton) && controller.previewAlignButton.isHidden)
 precondition(controller.thresholdLabel.superview === controller.eyeSetupStack)
 precondition(controller.thresholdSlider.superview?.superview === controller.eyeSetupStack,
              "The threshold label, slider and value must collapse with Camera setup")
@@ -223,13 +224,15 @@ let laptopScreen = NSScreen.screens.first { candidate in
     return CGDisplayIsBuiltin(number.uint32Value) != 0
 } ?? screen
 let id = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as! NSNumber).stringValue
-func state(_ phase: String, valid: Bool = true, headPitch: Double = 0, cursor: Bool = false, tracked: Bool = true, irEye: Bool = false, circleStart: Double? = nil, fixedTarget: [Double]? = nil, savedTarget: [Double]? = nil, rawGaze: [Double]? = nil, references: Bool = false, webcamRays: [[Double]] = [[0,0,-1],[0,0,-1]], referenceCount: Int = 1, referenceSession: String = "test", referenceShift: Double = 0, geometric: Bool = false, accuracy: [String:Any]? = nil, eyeSide: String? = nil, calibrationProgress: Double = 0.9, accepted: Bool = true, targetIndex: Int = 2, calibrationTarget: [Double]? = nil, cursorProgress: Double = 0.4, irSlots: [String: Any] = [:]) -> TrackerState {
+func state(_ phase: String, valid: Bool = true, headPitch: Double = 0, headX: Double = 0.5, cursor: Bool = false, tracked: Bool = true, irEye: Bool = false, circleStart: Double? = nil, fixedTarget: [Double]? = nil, savedTarget: [Double]? = nil, rawGaze: [Double]? = nil, references: Bool = false, webcamRays: [[Double]] = [[0,0,-1],[0,0,-1]], referenceCount: Int = 1, referenceSession: String = "test", referenceShift: Double = 0, geometric: Bool = false, continuous: Bool = false, headApplied: Bool = false, accuracy: [String:Any]? = nil, eyeSide: String? = nil, calibrationProgress: Double = 0.9, accepted: Bool = true, targetIndex: Int = 2, calibrationTarget: [Double]? = nil, cursorProgress: Double = 0.4, irSlots: [String: Any] = [:], eyePredictions: [String: Any] = [:], binocularStatus: String? = nil, headWidth: Double = log(0.3), headReference: [Double]? = nil, guidedOutcome: String? = nil) -> TrackerState {
     let complete = phase == "complete"
     let captured: [[String:Any]] = references ? (0..<referenceCount).map { i in
         var head = neutralHead; head[3] += referenceShift + Double(i)*0.0001
         return ["id":i+1,"eye":[0.5,0.4],"head":head,"target":[0.8,0.2],"source":"cursor","predicted_before":[0.6,0.4]]
     } : []
     let payload: [String: Any] = [
+        "eye_predictions":eyePredictions,
+        "binocular_status":binocularStatus as Any? ?? NSNull(),
         "eye_cameras": eyeSide != nil ? ["active_eye":eyeSide!,"eyes":irSlots,"devices":[]] as Any : NSNull(),
         "source": "test", "camera_connected": true, "valid": valid, "display_valid": valid && complete,
         "calibrated": complete, "desktop_cursor": complete,
@@ -237,12 +240,12 @@ func state(_ phase: String, valid: Bool = true, headPitch: Double = 0, cursor: B
         "gaze": complete && valid ? [0.5,0.5] as Any : NSNull(),
         "unclamped_gaze":valid ? rawGaze as Any? ?? NSNull() : NSNull(),
         "head_camera": ["name":"Test webcam", "connected":true,"face_visible":tracked,"fps":30.0,
-                        "features":[0.0,headPitch,0.0,0.5,0.4,log(0.3)],"eye_rays":webcamRays],
+                        "features":[0.0,headPitch,0.0,headX,0.4,headWidth],"eye_rays":webcamRays],
         "eye_direction": irEye && tracked ? ["vector":[0.1,0.2,0.97],"center":[320.0,240.0],"pupil":[325.0,245.0],
-                                               "head_features":[0.0,headPitch,0.0,0.5,0.4,log(0.3)],"model_ready":true] as Any : NSNull(),
+                                               "head_features":[0.0,headPitch,0.0,headX,0.4,headWidth],"model_ready":true] as Any : NSNull(),
         "blink_click_enabled": false,
         "eye_model": ["phase": "collecting", "can_freeze": false, "message": "Test"],
-        "onboarding": ["accuracy_check":accuracy as Any? ?? NSNull(),"phase": phase, "display_id": id, "display_index": 1, "display_count": 1,
+        "onboarding": ["guided_head_outcome":guidedOutcome as Any? ?? NSNull(),"remaining_seconds":phase == "motion" ? 24.0 as Any : NSNull(),"head_reference":headReference as Any? ?? NSNull(),"accuracy_check":accuracy as Any? ?? NSNull(),"phase": phase, "display_id": id, "display_index": 1, "display_count": 1,
                        "target": complete ? NSNull() as Any : (calibrationTarget ?? [0.08,0.92]), "progress": complete ? 1.0 : calibrationProgress,
                        "message": "Test", "elapsed": 10.0, "fast_path": false, "sample_accepted": accepted,
                        "stopped_stage": "head",
@@ -250,7 +253,7 @@ func state(_ phase: String, valid: Bool = true, headPitch: Double = 0, cursor: B
                        "screen_path_started_at": circleStart as Any? ?? NSNull(), "screen_target_index":targetIndex,
                        "screen_fit_status": "Eye and target positions disagree; refining fit",
                        "calibration_rays":captured,"calibration_session_id":referenceSession,
-                       "geometry_calibration":geometric ? ["phase":"validate","message":"Checking fresh measurements","remaining_seconds":4.0,"applied":false] as Any : NSNull(),
+                       "geometry_calibration":geometric ? ["continuous":continuous,"total_samples":240,"applied_updates":2,"phase":"validate","message":"Checking fresh measurements","remaining_seconds":4.0,"applied":headApplied] as Any : NSNull(),
                        "geometry_model":geometric ? ["depth_screen_widths":1.4,"reference_log_face_width":log(0.3),"camera_aspect":16.0/9.0,"eye_separation_screen_widths":6.4/30.2] as Any : NSNull(),
                        "cursor_calibration": ["active":cursor,"positions":1,"ready":true,"message":"Live alignment",
                                               "stage":geometric ? "geometry" : "positions","remaining_seconds":4.0,"head_cue":NSNull(),"progress":cursorProgress,"live_preview":true,
@@ -272,6 +275,7 @@ precondition(abs(rightOrigin.x - leftOrigin.x - eyeOriginScene.eyeSeparation()) 
              "The selected tracking eye must also select the anatomical origin in the scene")
 // Webcam predictions must depend on each iris, never the selected target.
 let webcamPreview = AngleDebugger()
+webcamPreview.rawDirections.state = .on
 webcamPreview.update(state("complete", webcamRays: []), at: 10)
 webcamPreview.rebuild(at: 10)
 precondition(webcamPreview.geometry.childNode(withName: "webcam-eye-0", recursively: true) == nil,
@@ -301,23 +305,83 @@ precondition(webcamPreview.geometry.childNode(withName: "webcam-screen-hit-0", r
 precondition(webcamPreview.geometry.childNode(withName: "webcam-screen-hit-1", recursively: true)!.simdPosition == initialWebcamHits[1],
              "Changing one iris must leave the other eye prediction unchanged")
 // Independent USB rays must never converge on the cursor merely because it exists.
-func irSlot(_ side: String, _ vector: [Double]?, connected: Bool = true, epoch: String = "0:1") -> [String: Any] {
+func irSlot(_ side: String, _ vector: [Double]?, connected: Bool = true, epoch: String = "0:1", capturedAt: Double = 1) -> [String: Any] {
     ["device_id":side+"-usb", "rotation":side == "left" ? 180 : 0, "connected":connected,
      "fps":30.0, "status":"Connected", "tracking_epoch":epoch,
-     "scene_direction":vector.map { ["vector":$0,"head_features":neutralHead] } as Any? ?? NSNull()]
+     "scene_direction":vector.map { ["vector":$0,"head_features":neutralHead,"captured_at":capturedAt] } as Any? ?? NSNull()]
 }
+// A screen prediction alone must never fabricate an eye-to-cursor ray.
+let projectionScene = AngleDebugger()
+precondition(projectionScene.rawDirections.state == .on)
+func projectedNode(_ name: String) -> SCNNode? { projectionScene.geometry.childNode(withName:name,recursively:true) }
+projectionScene.update(state("complete",irEye:true,rawGaze:[1.8,-1.2],eyeSide:"left"),at:30)
+projectionScene.rebuild(at:30)
+precondition(projectedNode("cursor-projection-ray") == nil)
+precondition(projectedNode("current-target-reference") == nil)
+precondition(projectedNode("ir-direction") == nil)
+let animatedPoint=[Double(laptopScreen.frame.midX+30),Double(screen.frame.maxY-laptopScreen.frame.midY+40)]
+projectionScene.followDisplayedCursor(animatedPoint,opacity:0.7)
+projectionScene.rebuild(at:30.1)
+precondition(projectedNode("calibrated-screen-gaze")!.simdPosition == projectionScene.sceneDesktopPoint(animatedPoint)!)
+precondition(projectedNode("calibrated-screen-gaze")!.geometry!.firstMaterial!.diffuse.contents as? NSColor == .white)
+projectionScene.followDisplayedCursor(nil)
+projectionScene.rebuild(at:30.2)
+precondition(projectedNode("calibrated-screen-gaze") == nil)
+func eyePrediction(_ side:String,_ uv:[Double]) -> [String:Any] {
+    ["uv":uv,"desktop":[Double(laptopScreen.frame.minX)+uv[0]*Double(laptopScreen.frame.width),Double(screen.frame.maxY-laptopScreen.frame.maxY)+uv[1]*Double(laptopScreen.frame.height)],
+     "head_features":neutralHead,"confidence":0.9,"identity":side+"-1"]
+}
+let pairedEyes = ["left":eyePrediction("left",[0.5,0.5]),"right":eyePrediction("right",[0.5,0.5])]
+let companionScene=AngleDebugger()
+companionScene.update(state("complete",irEye:true,eyeSide:"left",eyePredictions:pairedEyes),at:40)
+companionScene.rebuild(at:40)
+for side in ["left","right"] {
+    let beam=companionScene.geometry.childNode(withName:"calibrated-eye-ray-\(side)",recursively:true)!
+    let half=Float((beam.geometry as! SCNCylinder).height)/2
+    let end=beam.simdConvertPosition([0,half,0],to:companionScene.geometry)
+    let point=pairedEyes[side]!["desktop"] as! [Double]
+    precondition(simd_distance(end,companionScene.sceneDesktopPoint(point)!)<0.001,
+                 "Each calibrated beam must end at its own desktop dot")
+    let sign:Float=side == "left" ? -1 : 1
+    let (head,rotation)=companionScene.headGeometry(neutralHead)
+    let origin=head+rotation.act([sign*companionScene.eyeSeparation()/2+companionScene.value("cx"),2+companionScene.value("cy"),-5.8+companionScene.value("cz")])
+    precondition(simd_distance(beam.simdConvertPosition([0,-half,0],to:companionScene.geometry),origin)<0.001)
+    precondition(beam.geometry!.firstMaterial!.diffuse.contents as? NSColor == (side == "left" ? .systemPink : .systemOrange))
+}
+if let path = ProcessInfo.processInfo.environment["EYECURSOR_CALIBRATED_EYES_SNAPSHOT"] {
+    let renderer=SCNRenderer(device:nil,options:nil)
+    renderer.scene=companionScene.scene;renderer.pointOfView=companionScene.camera
+    let picture=renderer.snapshot(atTime:40,with:CGSize(width:1000,height:800),antialiasingMode:.multisampling4X)
+    let bitmap=NSBitmapImageRep(data:picture.tiffRepresentation!)!
+    try! bitmap.representation(using:.png,properties:[:])!.write(to:URL(fileURLWithPath:path))
+}
+let shiftedEyePoint=[Double(laptopScreen.frame.midX+50),Double(screen.frame.maxY-laptopScreen.frame.midY)]
+companionScene.followDisplayedEyes(["right":(shiftedEyePoint,0.5)])
+companionScene.rebuild(at:40.1)
+precondition(companionScene.geometry.childNode(withName:"calibrated-eye-ray-left",recursively:true) == nil)
+precondition(companionScene.geometry.childNode(withName:"calibrated-eye-hit-right",recursively:true)!.simdPosition == companionScene.sceneDesktopPoint(shiftedEyePoint)!)
+companionScene.followDisplayedEyes([:]);companionScene.rebuild(at:40.2)
+precondition(companionScene.geometry.childNode(withName:"calibrated-eye-ray-right",recursively:true) == nil)
+precondition(controller.gazeEyes.itemTitles == ["Both eyes","Left eye only","Right eye only"])
+precondition(controller.eyeDots["left"]!.frame.size == controller.eyeDots["right"]!.frame.size,
+             "Eye cursor rings must share the same component and size")
+precondition(controller.eyeDots.count == 2 && controller.angleDebugger.separateEyes.state == .off)
+for panel in controller.eyeDots.values { precondition(panel.ignoresMouseEvents && !panel.canBecomeKey) }
 let irScene = AngleDebugger()
+irScene.rawDirections.state = .on
 let irSlots = ["left":irSlot("left", [0.12,0.04,1]), "right":irSlot("right", [-0.22,-0.06,1])]
 func irState(_ slots: [String:Any]) -> TrackerState {
     state("complete", irEye:true, rawGaze:[0.6,0.4], webcamRays:[], eyeSide:"right", irSlots:slots)
 }
 irScene.update(irState(irSlots), at:20); irScene.rebuild(at:20)
 func irNode(_ name: String) -> SCNNode? { irScene.geometry.childNode(withName:name, recursively:true) }
-let initialIRHits = ["left","right"].map { irNode("ir-camera-hit-"+$0)!.simdPosition }
-let cursorHit = irNode("calibrated-screen-gaze")!.simdPosition
-let cursorRay = irNode("live-gaze-ray")!.simdTransform
-precondition(simd_distance(initialIRHits[0], initialIRHits[1]) > 1)
-precondition(abs(irNode("ir-camera-origin-right")!.simdPosition.x-irNode("ir-camera-origin-left")!.simdPosition.x-irScene.eyeSeparation()) < 0.001)
+precondition(irNode("ir-camera-origin-left") == nil && irNode("ir-camera-origin-right") == nil &&
+             irNode("ir-camera-hit-left") == nil && irNode("ir-camera-hit-right") == nil,
+             "IR eye directions must be shown as lines without per-eye dots")
+let initialIRLines = ["left","right"].map { irNode("ir-camera-ray-"+$0)!.simdTransform }
+precondition(irNode("calibrated-screen-gaze") != nil, "A raw optical miss must not suppress calibrated screen gaze")
+precondition(irNode("live-gaze-ray") == nil,
+             "The green single-cursor ray must not be rendered in the 3D scene")
 for (side, vector) in [("left",SIMD3<Float>(-0.12,0.04,-1)),("right",SIMD3<Float>(0.22,-0.06,-1))] {
     let measured = irNode("ir-camera-ray-"+side)!.simdOrientation.act(SIMD3<Float>(0,1,0))
     precondition(simd_distance(measured,AngleGeometry.unit(vector)) < 0.0001,
@@ -326,24 +390,23 @@ for (side, vector) in [("left",SIMD3<Float>(-0.12,0.04,-1)),("right",SIMD3<Float
 precondition(irScene.cameraRayMetrics.stringValue.contains("Left IR:") && irScene.cameraRayMetrics.stringValue.contains("Right IR:"))
 irScene.sliders["tx"]!.doubleValue = 90; irScene.sliders["ty"]!.doubleValue = 10
 irScene.rebuild(at:20.1)
-precondition(irNode("ir-camera-hit-left")!.simdPosition == initialIRHits[0] && irNode("ir-camera-hit-right")!.simdPosition == initialIRHits[1],
+precondition(irNode("ir-camera-ray-left")!.simdTransform == initialIRLines[0] &&
+             irNode("ir-camera-ray-right")!.simdTransform == initialIRLines[1],
              "Moving the target must not steer either camera ray")
 irScene.update(irState(["left":irSlot("left", [0.7,0.05,1]),"right":irSlots["right"]!]), at:21)
 irScene.rebuild(at:21)
-precondition(irNode("ir-camera-hit-left")!.simdPosition != initialIRHits[0])
-precondition(irNode("ir-camera-hit-right")!.simdPosition == initialIRHits[1])
-precondition(irScene.cameraRayMetrics.stringValue.contains("outside"), "Do not clamp off-screen measurements")
-precondition(irNode("calibrated-screen-gaze")!.simdPosition == cursorHit && irNode("live-gaze-ray")!.simdTransform == cursorRay,
-             "Per-eye visualization must preserve the existing single cursor estimate")
-precondition(irScene.geometry.childNodes.filter { $0.name == "calibrated-screen-gaze" }.count == 1)
+precondition(irNode("ir-camera-ray-left")!.simdTransform != initialIRLines[0])
+precondition(irNode("ir-camera-ray-right")!.simdTransform == initialIRLines[1])
+precondition(!irScene.cameraRayMetrics.stringValue.contains("outside") && irScene.cameraRayMetrics.stringValue.contains("mount unknown"), "Unknown camera mounting must not claim a screen hit or miss")
+precondition(irNode("calibrated-screen-gaze") != nil, "Raw optical directions are diagnostic only")
 irScene.update(irState(["left":irSlot("left", nil, connected:false),"right":irSlots["right"]!]), at:22)
 irScene.rebuild(at:22)
-precondition(irNode("ir-camera-ray-left") == nil && irNode("ir-camera-hit-left") == nil)
+precondition(irNode("ir-camera-ray-left") == nil)
 precondition(irNode("ir-camera-ray-right") != nil)
 precondition(irScene.cameraRayMetrics.stringValue.contains("Left IR: unavailable"))
 irScene.update(irState(["left":irSlot("left", [0,0,-1], epoch:"0:2"),"right":irSlots["right"]!]), at:22.1)
 irScene.rebuild(at:22.1)
-precondition(irNode("ir-camera-ray-left") != nil && irNode("ir-camera-hit-left") == nil,
+precondition(irNode("ir-camera-ray-left") != nil,
              "Backward rays must not invent a screen intersection, including after a reconnect")
 irScene.rebuild(at:23)
 precondition(irNode("ir-camera-ray-left") == nil && irNode("ir-camera-ray-right") == nil,
@@ -358,9 +421,101 @@ if let path = ProcessInfo.processInfo.environment["EYECURSOR_BINOCULAR_SNAPSHOT"
 }
 irScene.invalidate(); irScene.rebuild(at:24.1)
 precondition(irNode("ir-camera-ray-left") == nil && irNode("ir-camera-ray-right") == nil)
+// Build measurements from two known forward physical rays, not cursor labels.
+let midpointScene = AngleDebugger()
+midpointScene.update(irState(irSlots),at:50)
+let anchor = midpointScene.anchorDisplay!
+let (planeCenter,planeRotation,planeWidth,planeHeight) = midpointScene.displayTransform(anchor)
+let targetUVs: [String:SIMD2<Float>] = ["left":[0.28,0.38],"right":[0.66,0.70]]
+var midpointSlots: [String:Any] = [:]
+var expectedHits: [String:[Double]] = [:]
+for side in ["left","right"] {
+    let uv = targetUVs[side]!
+    let target = planeCenter+planeRotation.act([(uv.x-0.5)*planeWidth,(0.5-uv.y)*planeHeight,0])
+    let origin = midpointScene.cameraRay(side,at:50)!.origin
+    let ray = AngleGeometry.unit(target-origin)
+    midpointSlots[side] = irSlot(side,[-Double(ray.x),Double(ray.y),-Double(ray.z)],epoch:"fixture")
+    expectedHits[side] = [Double(anchor.frame.minX)+Double(uv.x)*Double(anchor.frame.width),
+                         Double(screen.frame.maxY-anchor.frame.maxY)+Double(uv.y)*Double(anchor.frame.height)]
+}
+midpointScene.update(irState(midpointSlots),at:51);midpointScene.rebuild(at:51)
+let rawMidpoint = midpointScene.cameraScreenMidpoint(at:51)!
+let expectedMidpoint = zip(expectedHits["left"]!,expectedHits["right"]!).map { pair in (pair.0+pair.1)/2 }
+for axis in 0..<2 { precondition(abs(rawMidpoint[axis]-expectedMidpoint[axis])<0.01) }
+for side in ["left","right"] {
+    let beam = midpointScene.geometry.childNode(withName:"ir-camera-ray-"+side,recursively:true)!
+    let half = Float((beam.geometry as! SCNCylinder).height)/2
+    let start = beam.simdConvertPosition([0,-half,0],to:midpointScene.geometry)
+    let end = beam.simdConvertPosition([0,half,0],to:midpointScene.geometry)
+    precondition(simd_distance(start,midpointScene.cameraRay(side,at:51)!.origin)<0.001)
+    precondition(simd_distance(end,start)<=8.001,"Raw directions must remain short diagnostic stubs")
+    precondition(beam.geometry!.firstMaterial!.diffuse.contents as? NSColor == .gray)
+}
+if let path = ProcessInfo.processInfo.environment["EYECURSOR_MIDPOINT_SNAPSHOT"] {
+    let renderer = SCNRenderer(device:nil,options:nil)
+    renderer.scene = midpointScene.scene; renderer.pointOfView = midpointScene.sceneView.pointOfView
+    let picture = renderer.snapshot(atTime:51,with:NSSize(width:1000,height:750),antialiasingMode:.multisampling4X)
+    let bitmap = NSBitmapImageRep(data:picture.tiffRepresentation!)!
+    try! bitmap.representation(using:.png,properties:[:])!.write(to:URL(fileURLWithPath:path))
+}
+midpointScene.rawDirections.state = .off
+midpointScene.update(state("complete",irEye:true,eyeSide:"left",irSlots:midpointSlots,eyePredictions:pairedEyes,binocularStatus:"disagreement"),at:51.1)
+midpointScene.rebuild(at:51.1)
+precondition(midpointScene.cameraScreenMidpoint(at:51.1) == rawMidpoint,
+             "Visibility, selected eye and learned map disagreement must not change the raw midpoint")
+precondition(midpointScene.geometry.childNode(withName:"ir-camera-ray-left",recursively:true) == nil)
+let leftFixture = midpointSlots["left"] as! [String:Any]
+let leftDirection = (leftFixture["scene_direction"] as! [String:Any])["vector"] as! [Double]
+var skewedSlots = midpointSlots
+skewedSlots["left"] = irSlot("left",leftDirection,epoch:"fixture",capturedAt:2)
+midpointScene.update(irState(skewedSlots),at:51.2)
+precondition(midpointScene.cameraScreenMidpoint(at:51.2) == nil, "Unpaired capture times must not fuse")
+midpointScene.update(irState(["left":irSlot("left",nil),"right":midpointSlots["right"]!]),at:51.3)
+precondition(midpointScene.cameraScreenMidpoint(at:51.3) == nil, "One hit is not a binocular midpoint")
+midpointScene.update(irState(["left":irSlot("left",[0,0,-1],epoch:"back"),"right":midpointSlots["right"]!]),at:51.4)
+precondition(midpointScene.cameraScreenMidpoint(at:51.4) == nil, "A backward ray cannot hit a screen in front")
+midpointScene.update(irState(midpointSlots),at:52)
+precondition(midpointScene.cameraScreenMidpoint(at:53) == nil, "Expired rays cannot hold a fresh midpoint")
+// Native cursor and optional per-eye rings consume calibrated screen mappings,
+// never raw directions or the scene's assumed mounting/depth controls.
+controller.angleDebugger.separateEyes.state = .on
+let calibratedEyes = ["left":eyePrediction("left",[0.48,0.5]),"right":eyePrediction("right",[0.52,0.5])]
+controller.hideCursor()
+for side in ["left","right"] { controller.eyeMotions[side]?.reset() }
+deliver(state("complete",irEye:true,eyeSide:"right",irSlots:irSlots,eyePredictions:calibratedEyes,binocularStatus:"binocular"))
+precondition(controller.dot.isVisible)
+precondition(abs(controller.dot.frame.midX-laptopScreen.frame.midX)<1)
+precondition(controller.eyeDots["left"]!.frame.midX < controller.eyeDots["right"]!.frame.midX)
+let calibratedCursorFrame = controller.dot.frame
+let oldYaw = controller.angleDebugger.sliders["yaw"]!.doubleValue
+controller.angleDebugger.sliders["yaw"]!.doubleValue = 80
+controller.angleDebugger.rawDirections.state = .off
+controller.animateCursor()
+precondition(controller.dot.frame == calibratedCursorFrame,
+             "Raw visibility and assumed camera mount must not override learned calibration")
+controller.angleDebugger.sliders["yaw"]!.doubleValue = oldYaw
+controller.angleDebugger.rawDirections.state = .on
+controller.angleDebugger.separateEyes.state = .off
+controller.hideCursor()
+// An identical face must stay in the same scene position across all calibration
+// phases, including introducing a different learned head reference/depth.
+let stableHeadScene = AngleDebugger()
+let smallFace = -1.85
+var learnedReference = neutralHead; learnedReference[5] = smallFace
+stableHeadScene.update(state("idle",headWidth:smallFace),at:60)
+let faceBeforeCalibration = stableHeadScene.headGeometry(learnedReference).0
+for (i,phase) in ["fitting","screen","complete"].enumerated() {
+    stableHeadScene.update(state(phase,geometric:i == 2,headWidth:smallFace,headReference:learnedReference),at:60.1+Double(i)*0.1)
+    precondition(simd_distance(stableHeadScene.headGeometry(learnedReference).0,faceBeforeCalibration)<0.001,
+                 "Screen calibration must not reset the illustration's distance reference")
+}
+var closer = learnedReference; closer[5] += log(1.2)
+precondition(stableHeadScene.headGeometry(closer).0.z < faceBeforeCalibration.z,
+             "Real changes in apparent face size must still move the estimated head")
 // Hold the rendered pose, including a partially smoothed movement, through
 // lost detections, expired measurements, and a failed tracker poll.
 let heldPreview = AngleDebugger()
+heldPreview.rawDirections.state = .on
 precondition(heldPreview.geometry.childNode(withName: "tracked-head", recursively: true) == nil,
              "Before the first detection there must be no simulated head")
 heldPreview.update(state("complete", headPitch: 0.4, irEye: true), at: 100)
@@ -371,7 +526,7 @@ let heldEye = heldPreview.lastEye
 let heldMetrics = heldPreview.metrics.stringValue
 let angularValueStart = (heldMetrics as NSString).range(of: ": ").upperBound
 precondition(heldPreview.metrics.attributedStringValue.attribute(.foregroundColor, at: angularValueStart, effectiveRange: nil) as? NSColor == .white)
-let heldNodes = ["tracked-head", "webcam-eye-0", "webcam-eye-1", "ir-direction"]
+let heldNodes = ["tracked-head", "webcam-eye-0", "webcam-eye-1"]
 let heldTransforms = heldNodes.map { heldPreview.geometry.childNode(withName: $0, recursively: true)!.simdTransform }
 func assertHeldPose() {
     precondition(heldPreview.lastEye == heldEye, "Tracking loss must hold the last rendered eye position")
@@ -434,14 +589,24 @@ for pitch in [-Double.pi/6, Double.pi/6] {
     precondition(simd_length(AngleGeometry.headRotation(pose,relativeTo: pose).act(headForward)-headForward) < 0.00001,
                  "Neutral capture must also cancel pitch")
 }
+deliver(state("idle"))
+precondition(!controller.active && !controller.window.isVisible)
+precondition(controller.calibrationSteps.actionButton.title == "Start calibration")
+precondition(controller.calibrateMenu.title == "Start calibration")
+precondition(controller.calibrationSteps.headButton.superview === controller.calibrationSteps)
+precondition(!controller.calibrationSteps.headButton.isHidden && !controller.calibrationSteps.headButton.isEnabled)
+precondition(controller.calibrationSteps.countdown.stringValue.contains("when you are prepared"))
+precondition(controller.calibrationSteps.headButton.action == #selector(CalibrationApp.practiceHeadMovement))
+controller.calibrationSteps.layoutSubtreeIfNeeded()
+precondition(controller.calibrationSteps.headButton.frame.minY > controller.calibrationSteps.rows[0].frame.maxY)
 deliver(state("screen"))
 precondition(controller.calibrationSteps.actionButton.title == "Stop calibration")
-precondition(!controller.calibrationSteps.manualButton.isHidden && controller.calibrationSteps.manualButton.isEnabled)
-precondition(controller.cursorAlignMenu.isEnabled,
-             "Manual calibration must be available even while guided calibration is running")
+precondition(controller.calibrationSteps.manualButton.isHidden)
+precondition(!controller.cursorAlignMenu.isEnabled,
+             "Guided calibration must keep one active workflow until stopped")
 precondition(controller.calibrationSteps.manualButton.action == #selector(CalibrationApp.alignWithCursor))
 controller.calibrationSteps.layoutSubtreeIfNeeded()
-precondition(controller.calibrationSteps.manualButton.frame.maxY <= controller.calibrationSteps.actionButton.frame.minY)
+precondition(!controller.calibrationSteps.actionButton.isHidden)
 if let path = ProcessInfo.processInfo.environment["EYECURSOR_MANUAL_SNAPSHOT"] {
     let view=controller.calibrationSteps
     view.scrollToVisible(view.bounds)
@@ -454,13 +619,13 @@ if let path = ProcessInfo.processInfo.environment["EYECURSOR_MANUAL_SNAPSHOT"] {
 }
 
 precondition(controller.calibrationSteps.rows.filter { !$0.isHidden }.count == 3)
-precondition(controller.calibrationSteps.rows[0].stringValue.hasPrefix("1. Look at center"))
+precondition(controller.calibrationSteps.rows[0].stringValue.hasPrefix("1. Follow five dots"))
 precondition(controller.calibrationSteps.actionButton.isEnabled)
 let pathStart = ProcessInfo.processInfo.systemUptime - 0.15
 let circleState = state("screen", circleStart: pathStart)
 deliver(circleState)
 precondition(controller.window.isVisible && controller.active)
-precondition(controller.calibrationSteps.rows[1].stringValue.contains("four dots"))
+precondition(controller.calibrationSteps.rows[0].stringValue.contains("five dots"))
 precondition(controller.calibrationSteps.countdown.stringValue.contains("available"))
 precondition(controller.calibrationSteps.countdown.stringValue.contains("samples"))
 let circleOrigin = controller.window.frame.origin
@@ -502,6 +667,22 @@ controller.refresh()
 precondition(!controller.calibrationSteps.actionButton.isEnabled, "Stale state must not allow retry")
 precondition(!controller.changing, "A delayed poll must not POST cancellation")
 precondition(controller.active, "A delayed poll must not discard calibration UI state")
+controller.angleDebugger.separateEyes.state = .on
+for side in ["left","right"] { controller.eyeMotions[side]?.reset() }
+deliver(state("complete",eyeSide:"left",eyePredictions:pairedEyes,binocularStatus:"binocular"))
+precondition(controller.eyeDots["left"]!.isVisible && controller.eyeDots["right"]!.isVisible)
+precondition(controller.eyeDots["left"]!.frame.midX == controller.eyeDots["right"]!.frame.midX)
+precondition(controller.eyeDots["left"]!.frame.midY == controller.eyeDots["right"]!.frame.midY)
+precondition(controller.eyeDots["left"]!.frame.width == controller.eyeDots["right"]!.frame.width,
+             "Both eyes must use the same ring size even when their estimates overlap")
+deliver(state("complete",valid:false,eyeSide:"left",binocularStatus:"disagreement"))
+precondition(controller.angleDebugger.cameraRayMetrics.stringValue.contains("Shared fixation uncertain") || controller.angleDebugger.rawDirections.state == .on)
+precondition(controller.angleDebugger.geometry.childNode(withName:"cursor-projection-ray",recursively:true) == nil,
+             "Disagreement must not fall back to a confident selected-eye beam")
+controller.angleDebugger.separateEyes.state = .off
+controller.animateCursor()
+precondition(!controller.eyeDots["left"]!.isVisible && !controller.eyeDots["right"]!.isVisible)
+for side in ["left","right"] { controller.eyeMotions[side]?.reset() }
 deliver(state("complete"))
 precondition(controller.diagnosticText.stringValue == "Calibration complete",
              "Completed IR status must not include changing gaze or pupil details")
@@ -516,24 +697,29 @@ precondition(controller.dot.isVisible && !controller.changing, "Stale cursor sta
 deliver(state("complete"))
 precondition(controller.dot.isVisible, "Fresh gaze must restore the circle after a poll gap")
 deliver(state("complete",valid:false))
-precondition(controller.angleDebugger.geometry.childNode(withName: "calibrated-screen-gaze", recursively: true) == nil)
+precondition(controller.angleDebugger.geometry.childNode(withName: "calibrated-screen-gaze", recursively: true) != nil,
+             "The scene marker must fade together with the displayed desktop cursor")
+precondition(controller.angleDebugger.geometry.childNode(withName:"cursor-projection-ray",recursively:true) == nil)
 precondition(controller.dot.isVisible, "Missing gaze must start fading the presentation")
 let lossTime = ProcessInfo.processInfo.systemUptime
 controller.animateCursor(at: lossTime + 0.75)
 precondition(controller.dot.isVisible && controller.dot.alphaValue > 0 && controller.dot.alphaValue < 0.51)
 controller.animateCursor(at: lossTime + 1.51)
 precondition(!controller.dot.isVisible, "The panel must hide after its fade completes")
+precondition(controller.angleDebugger.geometry.childNode(withName:"cursor-projection-ray",recursively:true) == nil)
+precondition(controller.angleDebugger.geometry.childNode(withName:"calibrated-screen-gaze",recursively:true) == nil)
 controller.hideCursor() // Restore the real clock after the deterministic future ticks.
 deliver(state("complete", cursor:true))
 precondition(controller.calibrationSteps.manualButton.isHidden)
 precondition(controller.calibrationSteps.rows.filter { !$0.isHidden }.count == 4,
              "Cursor alignment must retain its own four instructions")
-let mouseTarget = NSPoint(x: screen.frame.minX + screen.frame.width * 0.2,
-                          y: screen.frame.minY + screen.frame.height * 0.2)
+// NSWindow floors panel origins to logical pixels; use an integral mouse position.
+let mouseTarget = NSPoint(x: (screen.frame.minX + screen.frame.width * 0.2).rounded(),
+                          y: (screen.frame.minY + screen.frame.height * 0.2).rounded())
 controller.animateCursorReference(mouse:mouseTarget)
 precondition(controller.cursorReference.isVisible && controller.cursorReference.ignoresMouseEvents)
 precondition(controller.cursorReference.frame.midX == mouseTarget.x && controller.cursorReference.frame.midY == mouseTarget.y,
-             "Alignment reference must sit exactly on the system cursor")
+             "Alignment reference must sit exactly on the system cursor: \(controller.cursorReference.frame) target \(mouseTarget)")
 precondition(controller.cursorReferenceSurface.headCue == nil)
 precondition(controller.cursorReferenceSurface.progress == 0.4)
 deliver(state("complete", cursor:true, accepted:false, cursorProgress:0.1))
@@ -596,25 +782,82 @@ precondition(controller.calibrationSteps.countdown.stringValue.contains("Checkin
 precondition(abs(controller.cursorReference.frame.midX-screen.frame.midX)<1 && abs(controller.cursorReference.frame.midY-screen.frame.midY)<1,
              "The known target must remain at screen center independently of mouse movement")
 precondition(!controller.cursorReferenceSurface.hollow)
+deliver(state("complete",cursor:true,fixedTarget:[0.5,0.5],geometric:true,continuous:true))
+precondition(controller.calibrationSteps.heading.stringValue == "Continuous head calibration")
+precondition(controller.calibrationSteps.headButton.isEnabled)
+precondition(controller.calibrationSteps.headButton.title == "Finish head calibration")
+precondition(controller.calibrationSteps.actionButton.title == "Finish head calibration")
+precondition(controller.calibrationSteps.countdown.stringValue == "240 measurements · 2 checked updates")
+precondition(controller.calibrationSteps.rows[1].stringValue.contains("no required pattern"))
+precondition(controller.headPracticeMenu.title == "Finish head calibration")
+controller.localError=longMenuStatus
+controller.updateMenu()
+precondition(menuTextWidth(controller.statusMenu.title)<=menuTextWidth(controller.headPracticeMenu.title),
+             "Continuous capture errors must fit the concise Finish action width")
+precondition(controller.statusMenu.toolTip == longMenuStatus)
+controller.localError=nil;controller.updateMenu()
+
+controller.animateCursorReference()
+precondition(controller.cursorReferenceSurface.collecting && !controller.cursorReferenceSurface.completed)
+precondition(controller.cursorReferenceSurface.progress == 0,
+             "Continuous capture must not display a stuck completion percentage")
+deliver(state("complete",cursor:true,fixedTarget:[0.5,0.5],geometric:true,continuous:true,headApplied:true))
+controller.animateCursorReference()
+precondition(controller.cursorReferenceSurface.completed,
+             "A checked head fit must show a persistent success checkmark")
+deliver(state("complete",valid:false,cursor:true,fixedTarget:[0.5,0.5],geometric:true,continuous:true,headApplied:true))
+controller.animateCursorReference()
+precondition(controller.cursorReferenceSurface.completed)
+deliver(state("motion",cursor:true,fixedTarget:[0.5,0.5],geometric:true,continuous:true,calibrationTarget:[0.5,0.5]))
+precondition(controller.active && controller.window.isVisible)
+precondition(controller.calibrationSteps.heading.stringValue == "Calibration")
+precondition(controller.calibrationSteps.actionButton.title == "Stop calibration")
+precondition(controller.calibrationSteps.rows[0].stringValue.contains("✓"))
+precondition(controller.calibrationSteps.rows[1].stringValue.contains("Active"))
+precondition(controller.calibrationSteps.rows[2].stringValue.contains("check dots"))
+precondition(controller.calibrationSteps.manualButton.isHidden && controller.calibrationSteps.headButton.isHidden)
+controller.animateCursorReference()
+precondition(!controller.cursorReference.isVisible,"Guided motion uses the main target, not a second cursor target")
+precondition(!controller.cursorAlignMenu.isEnabled && !controller.headPracticeMenu.isEnabled)
+precondition(controller.calibrationSteps.countdown.stringValue.contains("24s left · Checking movement"))
+precondition(controller.surface.headCue == "both")
+// Completing motion transitions to the accuracy target in the same overlay.
+deliver(state("verify",guidedOutcome:"previous_fit_kept"))
+precondition(controller.calibrationSteps.rows[1].stringValue.contains("No correction learned"))
+precondition(!controller.calibrationSteps.rows[1].stringValue.contains("✓"),
+             "Elapsed head capture is not a successfully learned correction")
+deliver(state("verify",guidedOutcome:"applied"))
+precondition(controller.calibrationSteps.accuracyButton.isHidden && controller.calibrationSteps.accuracySummary.isHidden,
+             "Guided accuracy has one Stop button and no overlapping report")
+precondition(controller.active && controller.window.isVisible)
+precondition(controller.calibrationSteps.rows[2].stringValue.contains("Active"))
+precondition(controller.calibrationSteps.actionButton.title == "Stop calibration")
+deliver(state("refine"))
+precondition(controller.active && controller.window.isVisible)
+precondition(controller.calibrationSteps.heading.stringValue == "Learn from dots")
+precondition(controller.calibrationSteps.actionButton.title == "Stop calibration")
+precondition(controller.accuracyButton.isHidden)
+precondition(!controller.dot.isVisible)
+deliver(state("complete"))
+precondition(controller.accuracyButton.title == "Learn from dots")
 let physicalOrigin = controller.angleDebugger.referenceEyeOrigin(neutralHead)
-precondition(abs(physicalOrigin.z-controller.angleDebugger.value("width")*1.4)<0.001,
-             "The scene must use the same calibrated depth as the geometric cursor map")
+precondition(abs(physicalOrigin.z-controller.angleDebugger.value("distance"))<0.001,
+             "A gaze fit must not change the independent illustration distance")
 controller.timer?.invalidate(); controller.animationTimer?.invalidate(); controller.diagnosticTimer?.invalidate()
 let evidence = AngleDebugger()
 evidence.update(state("complete", irEye:true, rawGaze:[1.4,-0.2], references:true),at:200)
 evidence.rebuild(at:200)
 evidence.update(state("complete", irEye:true, rawGaze:[1.4,-0.2], references:true),at:200.4)
 evidence.rebuild(at:200.4)
-let savedBatch = evidence.geometry.childNode(withName:"saved-reference-rays",recursively:true)!
-precondition(savedBatch.geometry!.elements[0].primitiveCount == 1)
-precondition(savedBatch.geometry!.materials.allSatisfy {
-    $0.transparency == 0.25 && ($0.diffuse.contents as? NSColor) == .white && !$0.readsFromDepthBuffer && !$0.writesToDepthBuffer
-}, "Previous measurements and their endpoints must be white at 25 percent opacity")
+precondition(evidence.geometry.childNode(withName:"saved-reference-rays",recursively:true) == nil,
+             "Saved measurements must not render the former white reference beams")
+precondition(evidence.savedReferences.count == 1,
+             "Hiding saved measurement beams must preserve the recorded measurements")
 let currentReference = AngleDebugger()
 currentReference.update(state("screen", irEye:false, references:true),at:200)
 currentReference.rebuild(at:200)
-precondition(currentReference.referenceGeometry.childNode(withName:"saved-reference-rays",recursively:true) != nil,
-             "Accepted observations must be visible before screen calibration completes or a 3D eye model is ready")
+precondition(currentReference.referenceGeometry.childNode(withName:"saved-reference-rays",recursively:true) == nil,
+             "Accepted observations must not render white reference beams before screen calibration completes")
 precondition(abs(ScreenCalibrationPath.target(elapsed:6,corner:0).x - 0.08) < 0.00001)
 precondition(abs(ScreenCalibrationPath.target(elapsed:6,corner:3).y - 0.92) < 0.00001)
 if let path = ProcessInfo.processInfo.environment["EYECURSOR_CALIBRATION_SNAPSHOT"] {
@@ -624,42 +867,31 @@ if let path = ProcessInfo.processInfo.environment["EYECURSOR_CALIBRATION_SNAPSHO
     let bitmap = NSBitmapImageRep(data:picture.tiffRepresentation!)!
     try! bitmap.representation(using:.png,properties:[:])!.write(to:URL(fileURLWithPath:path))
 }
-let currentLine = currentReference.geometry.childNode(withName:"current-target-reference",recursively:true)!
-precondition(abs(currentLine.geometry!.firstMaterial!.transparency - 0.9) < 0.0001)
-let currentHalfLength = Float((currentLine.geometry as! SCNCylinder).height)/2
-precondition(simd_distance(currentLine.simdConvertPosition([0,currentHalfLength,0],to:currentReference.geometry),currentReference.lastTarget) < 0.0001,
-             "Only the current reference must connect the current eye to the active target")
+precondition(currentReference.geometry.childNode(withName:"current-target-reference",recursively:true) == nil,
+             "A known target must not fabricate a current eye direction")
 currentReference.update(state("complete", irEye:true, references:true),at:201)
 currentReference.rebuild(at:201)
 precondition(currentReference.geometry.childNode(withName:"current-target-reference",recursively:true) == nil,
              "A completed calibration must not leave an active target reference")
-let savedOrigin = evidence.referenceOrigins[1]!
 let (_,absoluteTurn) = evidence.headGeometry(combinedPose)
 precondition(simd_length(absoluteTurn.act(headForward)-headForward) > 0.0001,
              "The diagnostic scene must retain an actually rotated head")
-let ray = evidence.geometry.childNode(withName:"live-gaze-ray",recursively:true)!
-let rayHalfLength = Float((ray.geometry as! SCNCylinder).height)/2
-let rayEnd = ray.simdConvertPosition([0,rayHalfLength,0],to:evidence.geometry)
-precondition(rayEnd.x > evidence.value("width")/2 && abs(rayEnd.z) < 0.01,
-             "Live raw ray must reach its off-screen plane estimate, not the fenced desktop dot")
-let greenQuality = evidence.rayQuality
+precondition(evidence.geometry.childNode(withName:"live-gaze-ray",recursively:true) == nil &&
+             evidence.geometry.childNode(withName:"live-gaze-origin",recursively:true) == nil,
+             "The green/red single-cursor beam and origin must remain hidden")
 evidence.update(state("complete",valid:false,tracked:false,references:true),at:200.5)
 evidence.rebuild(at:200.5)
-precondition(evidence.rayQuality < greenQuality && evidence.rayQuality > 0)
-evidence.rebuild(at:202)
-precondition(evidence.rayQuality < 0.05 && evidence.geometry.childNode(withName:"live-gaze-ray",recursively:true) != nil,
-             "Lost tracking must leave a red last-known ray visible")
-precondition(evidence.referenceOrigins[1]! == savedOrigin)
+precondition(evidence.geometry.childNode(withName:"live-gaze-ray",recursively:true) == nil,
+             "Tracking loss must not render the former green/red single-cursor beam")
 evidence.update(state("complete",references:true,referenceCount:160),at:203)
 evidence.rebuild(at:203)
-precondition(evidence.referenceOrigins.count == 160)
-let allSaved = evidence.referenceGeometry.childNode(withName:"saved-reference-rays",recursively:true)!.geometry!
-precondition(allSaved.elements[0].primitiveCount == 160 && allSaved.elements[1].primitiveCount == 320,
-             "Every accepted measurement needs a white segment and both endpoints")
+precondition(evidence.savedReferences.count == 160)
+precondition(evidence.geometry.childNode(withName:"saved-reference-rays",recursively:true) == nil,
+             "Many accepted measurements must remain hidden as scene beams")
 evidence.update(state("complete",references:true,referenceCount:160,referenceSession:"next",referenceShift:0.1),at:204)
 evidence.rebuild(at:204)
-precondition(simd_distance(evidence.referenceOrigins[1]!,savedOrigin)>1,
-             "A new session with reused IDs and the same count cannot reuse old geometry")
+precondition(evidence.savedReferences.count == 160,
+             "A new measurement session remains available without rendering beams")
 precondition(!evidence.sceneView.cameraControlConfiguration.allowsTranslation)
 for _ in 0..<100 { evidence.sceneView.zoom(by:100) }
 precondition(simd_distance(evidence.camera.simdPosition,evidence.sceneView.orbitCenter) <= 240.01)

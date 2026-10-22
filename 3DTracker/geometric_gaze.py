@@ -65,7 +65,7 @@ class GeometricGazeMap:
         return np.asarray(raw)-(pose-self.reference)/HEAD_SCALE@self.head_coefficients
 
     @classmethod
-    def fit(cls,base,head_fit,seeds,samples,aspect,camera_aspect=16/9,eye_side="right"):
+    def fit(cls,base,head_fit,seeds,samples,aspect,camera_aspect=16/9,eye_side="right",robust=False):
         # Every seed is one entire center/corner fixation; motion is reduced to
         # time blocks so correlated frames cannot dominate the five screen anchors.
         if len(seeds)<5 or len(samples)<30:
@@ -94,27 +94,46 @@ class GeometricGazeMap:
         weights=np.r_[np.full(len(seeds),len(blocks)/len(seeds)),np.ones(len(blocks))]
         rotations=np.array([head_rotation(h) for h in poses])
         model.reference_width=float(np.median(poses[:len(seeds),5]))
-        best=None
+        best=None;max_retained=0.;best_motion_error=float("inf")
         for depth in np.linspace(.65,3.3,38):
             origins=np.array([eye_origin(h,depth,model.reference_width,aspect,camera_aspect,eye_side) for h in poses])
             world=np.array([screen_point(t,aspect) for t in targets])-origins
             local=np.einsum('nji,nj->ni',rotations,world)
             if np.any(local[:,2]>=-.1):continue
             tangents=local[:,:2]/-local[:,2,None]
-            coefficient=np.linalg.solve(design.T@(weights[:,None]*design)+np.diag([1e-8,.0001,.0001]),
-                                        design.T@(weights[:,None]*tangents))
-            model.depth=float(depth);model.coefficients=coefficient
-            prediction=[model.project_raw(e,h) for e,h in zip(eyes,poses)]
-            if any(p is None for p in prediction):continue
-            errors=np.linalg.norm(np.array(prediction)-targets,axis=1)
-            score=float(np.mean(errors[:len(seeds)]**2)+np.mean(errors[len(seeds):]**2))
-            if best is None or score<best[0]:best=(score,float(depth),coefficient.copy(),errors)
-        if best is None:raise ValueError('No forward-facing geometric eye ray could be fitted')
-        _,model.depth,model.coefficients,errors=best
-        if np.max(errors[:len(seeds)])>.08 or np.percentile(errors[len(seeds):],80)>.08:
+            effective=weights.copy()
+            for _ in range(5 if robust else 1):
+                coefficient=np.linalg.solve(design.T@(effective[:,None]*design)+np.diag([1e-8,.0001,.0001]),
+                                            design.T@(effective[:,None]*tangents))
+                local_fit=np.column_stack((design@coefficient,-np.ones(len(design))))
+                world_fit=np.einsum('nij,nj->ni',rotations,local_fit)
+                valid=world_fit[:,2]/np.linalg.norm(world_fit,axis=1)<-.05
+                intersections=origins-world_fit*(origins[:,2]/np.minimum(world_fit[:,2],-.001))[:,None]
+                prediction=np.column_stack((intersections[:,0]+.5,.5-intersections[:,1]*aspect))
+                errors=np.linalg.norm(prediction-targets,axis=1)
+                errors[~valid]=10.
+                if robust:
+                    motion_errors=errors[len(seeds):]
+                    median=np.median(motion_errors)
+                    mad=1.4826*np.median(np.abs(motion_errors-median))
+                    cutoff=min(.08,max(.025,median+3*mad))
+                    effective=weights*np.minimum(1.,cutoff/np.maximum(errors,1e-6))**2
+                    effective[:len(seeds)]=weights[:len(seeds)]
+            if not robust and not np.all(valid):continue
+            kept=errors[len(seeds):]<=cutoff if robust else np.ones(len(blocks),dtype=bool)
+            max_retained=max(max_retained,float(np.mean(kept)))
+            best_motion_error=min(best_motion_error,float(np.percentile(errors[len(seeds):],80)))
+            if robust and (np.sum(kept)<10 or np.mean(kept)<.7):continue
+            score=float(np.mean(errors[:len(seeds)]**2)+np.mean(errors[len(seeds):][kept]**2))
+            if best is None or score<best[0]:best=(score,float(depth),coefficient.copy(),errors,kept)
+        if best is None:raise ValueError(f'Geometric model retained at most {max_retained:.0%} of motion blocks; needs 70%. Best movement error {best_motion_error:.3f} UV')
+        _,model.depth,model.coefficients,errors,kept=best
+        selected=np.r_[np.ones(len(seeds),dtype=bool),kept]
+        model.fit_metrics={"motion_blocks":len(blocks),"retained_blocks":int(np.sum(kept)),"rejected_blocks":int(np.sum(~kept))}
+        if np.max(errors[:len(seeds)])>.08 or np.percentile(errors[len(seeds):][kept],80)>.08:
             raise ValueError('Eye rays and known targets disagree; the previous map is kept')
-        model.error=float(np.percentile(errors,80))
-        model.bounds=np.percentile(poses,[2,98],axis=0)
+        model.error=float(np.percentile(errors[selected],80))
+        model.bounds=np.percentile(poses[selected],[2,98],axis=0)
         model.eyes=np.array([model.correct_eye(e,h) for e,h,_ in seeds])
         return model
 

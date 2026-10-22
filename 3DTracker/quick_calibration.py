@@ -84,6 +84,7 @@ class QuickCalibration:
         self.finished=False
         self.timed_out=False
         self.rejections={}
+        self.advance_allowed=True
 
     @staticmethod
     def ready(block):
@@ -92,7 +93,7 @@ class QuickCalibration:
     def advance(self,now):
         if self.finished or self.timed_out:return
         block=self.blocks[self.index]
-        if now-self.corner_started_at>=STEP and self.ready(block) and now-block[-1][0]<=.15:
+        if now-self.corner_started_at>=STEP and self.ready(block) and now-block[-1][0]<=.15 and self.advance_allowed:
             if self.index==3:self.finished=True
             else:
                 self.index+=1
@@ -110,6 +111,7 @@ class QuickCalibration:
         self.corner_started_at=now
         self.finished=False;self.timed_out=False;self.last_stamp=None
         self.rejections={}
+        self.advance_allowed=True
 
     def target(self,now):
         return target_at(self.index*STEP+min(TRAVEL,max(0.,now-self.corner_started_at)))

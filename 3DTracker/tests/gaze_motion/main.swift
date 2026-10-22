@@ -15,6 +15,12 @@ for frame in 1...15 {
 }
 precondition(previous.x > 95, "Cursor should cover most of a sustained move within a quarter second")
 
+var snappy = GazeMotion()
+snappy.updateTarget(.zero, at: 0)
+snappy.updateTarget(CGPoint(x: 500,y: 0), at: 0)
+precondition(snappy.sample(at: 0.1)!.x > 450,
+             "A purposeful cursor move must cover 90 percent within 100 ms")
+
 func position(fps: Int) -> CGPoint {
     var easing = GazeMotion()
     easing.updateTarget(.zero, at: 0)
@@ -69,8 +75,9 @@ let prior = recover.sample(at: 0.400001)!
 let priorVelocity = (prior.x - recoveryStart.x) / 0.000001
 recover.updateTarget(CGPoint(x: -200, y: -100), at: 0.400001)
 precondition(recover.sample(at: 0.400001) == prior)
-let next = recover.sample(at: 0.400002)!
-precondition(abs((next.x - prior.x) / 0.000001 - priorVelocity) < 0.1,
+// Smaller derivative interval also resolves the faster response's acceleration.
+let next = recover.sample(at: 0.40000101)!
+precondition(abs((next.x - prior.x) / 0.00000001 - priorVelocity) < 0.1,
              "Reconciliation preserves instantaneous velocity before turning")
 let corrected = recover.sample(at: 0.8)!
 precondition(abs(corrected.x + 200) < 20 && recover.opacity > recoveryAlpha)

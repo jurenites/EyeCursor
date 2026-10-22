@@ -13,7 +13,7 @@ class ScreenGazeMotion:
     the accepted target without overshoot or speculative extrapolation. All
     distances are measured in screen fractions, independent of pixel density.
     """
-    def __init__(self, response=.08, expiry=.25):
+    def __init__(self, response=.02, expiry=.25):
         self.response = response
         self.expiry = expiry
         self.reset()
@@ -88,7 +88,9 @@ class ScreenGazeMotion:
         # Integrate only this frame interval. A long rejected interval must not
         # accumulate time credit and cause an immediate jump on confirmation.
         dt = min(max(0., timestamp - previous_time), .1)
-        alpha = -math.expm1(-dt / self.response)
+        # Settle small fixation noise gently, but follow purposeful motion fast.
+        response=max(self.response,.08) if np.linalg.norm((target-self.position)/np.asarray(viewport[2:]))<.025 else self.response
+        alpha = -math.expm1(-dt / response)
         self.position += alpha * (target - self.position)
         self.last_accepted = timestamp
 

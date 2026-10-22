@@ -10,10 +10,19 @@ struct CalibrationStep: Decodable {
     let progress: Double
     let message: String
 }
+struct DotLearningState: Decodable {
+    let target_index: Int
+    let target_count: Int
+    let remaining_seconds: Double
+    let message: String
+}
 struct TrackerState: Decodable {
     let source: String
     let eye_camera_id: String?
     let eye_cameras: EyeCamerasState?
+    var eye_predictions: [String: EyeScreenPrediction]? = nil
+    let binocular_status: String?
+    let gaze_eye_mode: String?
     let mode: String?
     let head_camera: HeadCameraState?
     let camera_connected: Bool
@@ -38,11 +47,19 @@ struct TrackerState: Decodable {
     let performance: TrackerPerformance?
     let eye_direction: DebugEyeDirection?
 }
+struct EyeScreenPrediction: Decodable {
+    let uv: [Double]
+    let desktop: [Double]
+    let head_features: [Double]
+    let confidence: Double
+    let identity: String
+}
 struct EyeCameraDevice: Decodable {
     let id: String
     let name: String
 }
 struct EyeCameraDirection: Decodable {
+    var captured_at: Double? = nil
     let vector: [Double]
     let head_features: [Double]
 }
@@ -80,6 +97,9 @@ struct HeadCameraState: Decodable {
     let eye_rays: [[Double]?]?
 }
 struct GeometryCalibrationState: Decodable {
+    let continuous: Bool?
+    let total_samples: Int?
+    let applied_updates: Int?
     let motion_hint: String?
     let phase: String
     let message: String
@@ -135,6 +155,9 @@ struct AccuracyCheckState: Decodable {
 }
 
 struct OnboardingState: Decodable {
+    let guided_head_outcome: String?
+    let dot_learning: DotLearningState?
+    let eye_map_status: [String:String]?
     let accuracy_check: AccuracyCheckState?
     let screen_path: String?
     let screen_path_started_at: Double?
@@ -143,6 +166,7 @@ struct OnboardingState: Decodable {
     let calibration_session_id: String?
     let head_correction_rank: Int?
     let head_correction_status: String?
+    let head_reference: [Double]?
     let geometry_calibration: GeometryCalibrationState?
     let geometry_model: GazeGeometryModel?
     let phase: String
@@ -185,12 +209,13 @@ final class CalibrationStepsView: NSView {
     let countdown = NSTextField(wrappingLabelWithString: "Waiting for cameras")
     let actionButton = NSButton(title: "Start calibration", target: nil, action: nil)
     let manualButton = NSButton(title: "Calibrate with system cursor", target: nil, action: nil)
-    let accuracyButton = NSButton(title: "Check accuracy", target: nil, action: nil)
+    let headButton = NSButton(title: "Calibrate head movement", target: nil, action: nil)
+    let accuracyButton = NSButton(title: "Learn from dots", target: nil, action: nil)
     let accuracySummary = NSTextField(wrappingLabelWithString: "Accuracy not checked for this mapping.")
     let rows = (0..<4).map { _ in NSTextField(wrappingLabelWithString: "") }
-    let descriptions = ["Look at center for about two seconds; keep your head comfortable and still",
-                        "Follow the four dots; keep your head still",
-                        "Check five new dots; these samples only measure accuracy"]
+    let descriptions = ["Follow five dots; keep your head comfortably still",
+                        "Watch the fixed center; gently turn and shift your head",
+                        "Follow the check dots; accuracy is measured automatically"]
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -200,41 +225,48 @@ final class CalibrationStepsView: NSView {
         countdown.alignment = .left
         actionButton.bezelStyle = .rounded
         manualButton.bezelStyle = .rounded
+        headButton.bezelStyle = .rounded
         accuracyButton.bezelStyle = .rounded
         accuracySummary.font = .systemFont(ofSize: 11)
         accuracySummary.textColor = .secondaryLabelColor
         addSubview(accuracyButton); addSubview(accuracySummary)
         addSubview(manualButton)
+        addSubview(headButton)
         addSubview(heading); addSubview(countdown); addSubview(actionButton)
         for row in rows { addSubview(row) }
         update(nil)
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     override var intrinsicContentSize: NSSize {
-        NSSize(width: NSView.noIntrinsicMetric, height: (accuracyButton.isHidden ? 0 : 126) + (manualButton.isHidden ? 130 : 166) + CGFloat(rows.filter { !$0.isHidden }.count) * 58)
+        NSSize(width: NSView.noIntrinsicMetric, height: CGFloat(36 + (accuracyButton.isHidden ? 0 : 126) + (manualButton.isHidden ? 130 : 166)) + CGFloat(rows.filter { !$0.isHidden }.count) * 58)
     }
     override func layout() {
         super.layout()
         heading.frame = NSRect(x: 0, y: bounds.height - 20, width: bounds.width, height: 20)
         countdown.frame = NSRect(x: 0, y: bounds.height - 90, width: bounds.width, height: 64)
+        headButton.frame = NSRect(x: 0, y: bounds.height - 126, width: bounds.width, height: 30)
         let footer: CGFloat = accuracyButton.isHidden ? 0 : 126
         accuracyButton.frame = NSRect(x: 0, y: 90, width: bounds.width, height: 30)
         accuracySummary.frame = NSRect(x: 0, y: 0, width: bounds.width, height: 84)
         actionButton.frame = NSRect(x: 0, y: footer + (manualButton.isHidden ? 0 : 36), width: bounds.width, height: 30)
         manualButton.frame = NSRect(x: 0, y: footer, width: bounds.width, height: 30)
         for (index, row) in rows.enumerated() {
-            row.frame = NSRect(x: 0, y: bounds.height - 150 - CGFloat(index) * 58, width: bounds.width, height: 54)
+            row.frame = NSRect(x: 0, y: bounds.height - 186 - CGFloat(index) * 58, width: bounds.width, height: 54)
         }
     }
     func update(_ flow: OnboardingState?, stale: Bool = false) {
         let phase = flow?.phase ?? "no_displays"
         manualButton.isHidden = flow?.cursor_calibration?.active == true || phase == "complete"
-        accuracyButton.isHidden = !["complete", "verify"].contains(phase)
+        accuracyButton.isHidden = !["complete", "verify", "refine"].contains(phase)
         accuracySummary.isHidden = accuracyButton.isHidden
-        let phases = ["head", "screen", "verify"]
         let paused = phase == "paused"
-        let current = phases.firstIndex(of: paused ? (flow?.stopped_stage ?? "") : phase)
-        let running = ["waiting", "fitting", "head", "screen", "verify"].contains(phase)
+        let stage = paused ? (flow?.stopped_stage ?? "") : phase
+        let current: Int? = ["waiting","fitting","head","screen"].contains(stage) ? 0 : stage == "motion" ? 1 : stage == "verify" ? 2 : nil
+        let running = ["waiting", "fitting", "head", "screen", "motion", "verify", "refine"].contains(phase)
+        manualButton.isHidden = running || flow?.cursor_calibration?.active == true || phase == "complete"
+        headButton.isHidden = running || paused
+        if phase == "refine" || (phase == "verify" && flow?.guided_head_outcome != nil) { accuracyButton.isHidden = true }
+        accuracySummary.isHidden = accuracyButton.isHidden
         actionButton.title = phase == "complete" ? "Align with system cursor" :
             running ? "Stop calibration" : paused ? "Retry step \((current ?? 0) + 1)" : "Start calibration"
         for (index, row) in rows.enumerated() {
@@ -242,17 +274,28 @@ final class CalibrationStepsView: NSView {
             guard !row.isHidden else { row.stringValue = ""; continue }
             let done = phase == "complete" || current.map { index < $0 } == true
             let selected = current == index
-            let suffix = done ? "  ✓" : selected ? (paused ? "  · Ready to retry" : "  · Active") : ""
+            let unchangedHead = index == 1 && done && flow?.guided_head_outcome == "previous_fit_kept"
+            let partialHead = index == 1 && done && flow?.guided_head_outcome == "partial"
+            let suffix = unchangedHead ? "  · No correction learned" : partialHead ? "  · One eye corrected" : done ? "  ✓" : selected ? (paused ? "  · Ready to retry" : "  · Active") : ""
             row.stringValue = "\(index + 1). \(descriptions[index])\(suffix)"
             row.font = .systemFont(ofSize: 13, weight: selected ? .semibold : .regular)
             row.textColor = stale ? .secondaryLabelColor : selected ? (paused ? .systemOrange : .systemBlue) : done ? .labelColor : .secondaryLabelColor
         }
         heading.stringValue = "Calibration"
-        if let cursor = flow?.cursor_calibration, cursor.active {
+        if stage == "refine" {
+            heading.stringValue = "Learn from dots"
+            for (i,row) in rows.enumerated() {
+                row.isHidden = i > 0
+                row.stringValue = "Follow five dots; each target teaches both eye maps"
+            }
+            if paused { actionButton.title = "Retry dot learning" }
+        }
+        if let cursor = flow?.cursor_calibration, cursor.active, phase != "motion" {
             heading.stringValue = "Cursor alignment"
             actionButton.title = cursor.ready ? "Finish cursor alignment" : "Stop cursor alignment"
             let practice = cursor.stage == "geometry"
-            if practice { heading.stringValue = "Fixed-target head calibration"; actionButton.title = "Stop head calibration" }
+            let continuous = practice && flow?.geometry_calibration?.continuous == true
+            if practice { heading.stringValue = continuous ? "Continuous head calibration" : "Fixed-target head calibration"; actionButton.title = continuous ? "Finish head calibration" : "Stop head calibration" }
             let previewAlignment = cursor.fixed_target != nil && !practice
             if previewAlignment {
                 heading.stringValue = "IR preview alignment"
@@ -261,8 +304,8 @@ final class CalibrationStepsView: NSView {
             let steps = previewAlignment ? ["Look at the fixed marker over the IR preview",
                          "Hold still for one second to save a reference",
                          "Keep watching it; move your head slightly and pause", cursor.message] : practice ? ["Keep looking at the fixed center dot",
-                         flow?.geometry_calibration?.motion_hint == "shift" ? "Slide your head sideways; keep your face forward" : "Turn your head gently left and right",
-                         "Keep watching the dot as your head moves", cursor.message] :
+                         continuous ? "Turn and shift your head naturally; no required pattern" : flow?.geometry_calibration?.motion_hint == "shift" ? "Slide your head sideways; keep your face forward" : "Turn your head gently left and right",
+                         continuous ? "Finish whenever ready; only checked improvements are kept" : "Keep watching the dot as your head moves", cursor.message] :
                         ["Look at the mouse; hold it still until the checkmark",
                          cursor.positions < 6 && cursor.ready == false ? "Save six positions across the screen; keep your head still" : "Move the pointer or your head to add measurements",
                          "When ready, press Finish cursor alignment", cursor.message]
@@ -271,7 +314,9 @@ final class CalibrationStepsView: NSView {
                 row.stringValue = "\(i+1). \(steps[i])"; row.textColor = .labelColor
             }
             invalidateIntrinsicContentSize(); needsLayout = true
-            countdown.stringValue = stale ? "Waiting for tracker response" : practice
+            countdown.stringValue = stale ? "Waiting for tracker response" : continuous
+                ? "\(flow?.geometry_calibration?.total_samples ?? 0) measurements · \(flow?.geometry_calibration?.applied_updates ?? 0) checked updates"
+                : practice
                 ? "\(Int(ceil(cursor.remaining_seconds ?? 15)))s left · \(flow?.geometry_calibration?.phase == "validate" ? "Checking" : "Learning")"
                 : cursor.stage == "center" ? "Hold a comfortable center position"
                 : "\(cursor.saved_anchors ?? cursor.positions) saved fixations · \(cursor.live_preview == true ? "Live adjustment" : "Collecting screen fit")"
@@ -279,9 +324,17 @@ final class CalibrationStepsView: NSView {
         }
         invalidateIntrinsicContentSize(); needsLayout = true
         if stale { countdown.stringValue = "Waiting for tracker response" }
-        else if phase == "complete" { countdown.stringValue = flow?.geometry_calibration?.message ?? flow?.message ?? "Ready" }
+        else if phase == "idle" { countdown.stringValue = "Ready. Start calibration when you are prepared." }
+        else if phase == "complete" { countdown.stringValue = flow?.message ?? "Ready" }
         else if paused { countdown.stringValue = flow?.blocker == "Stopped by user" ? "Stopped · Completed steps saved" : (flow?.blocker ?? "Stopped · Retry this step") }
         else if phase == "cancelled" { countdown.stringValue = "Calibration cancelled" }
+        else if phase == "refine", let learning = flow?.dot_learning {
+            countdown.stringValue = "Target \(learning.target_index)/\(learning.target_count) · \(Int(ceil(learning.remaining_seconds)))s available\n\(learning.message)"
+        }
+        else if phase == "motion" {
+            let checking = flow?.geometry_calibration?.phase == "validate"
+            countdown.stringValue = "\(Int(ceil(flow?.remaining_seconds ?? 0)))s left · \(checking ? "Checking movement" : "Learning movement")\n\(checking ? "Repeat the same small turns and shifts" : "Small turns and shifts; return to your starting position")"
+        }
         else if phase == "verify", let check = flow?.accuracy_check {
             countdown.stringValue = "Accuracy check \(check.target_index)/\(check.target_count) · \(Int(ceil(check.remaining_seconds)))s available\n\(flow?.blocker ?? "Look at the dot")"
         }
@@ -299,9 +352,13 @@ final class CalibrationStepsView: NSView {
 }
 
 final class DotView: NSView {
+    var color = NSColor.white
+    var ring = false
     override func draw(_ dirtyRect: NSRect) {
-        NSColor.white.withAlphaComponent(0.55).setFill()
-        NSBezierPath(ovalIn: bounds).fill()
+        color.withAlphaComponent(0.75).setFill()
+        color.setStroke()
+        let shape = NSBezierPath(ovalIn: bounds.insetBy(dx: 1, dy: 1))
+        if ring { shape.lineWidth = 2; shape.stroke() } else { shape.fill() }
     }
 }
 final class DotPanel: NSPanel {
@@ -314,6 +371,7 @@ final class CalibrationView: NSView {
     var accepted = false { didSet { needsDisplay = true } }
     var hollow = false { didSet { needsDisplay = true } }
     var completed = false { didSet { needsDisplay = true } }
+    var collecting = false { didSet { needsDisplay = true } }
     var headCue: String? { didSet { needsDisplay = true } }
     override var isOpaque: Bool { false }
     override func draw(_ dirtyRect: NSRect) {
@@ -340,13 +398,14 @@ final class CalibrationView: NSView {
         let feedbackColor: NSColor = completed ? .systemGreen : monochrome ? (accepted ? .white : .gray) : (accepted ? .systemGreen : .systemRed)
         feedbackColor.withAlphaComponent(0.45).setStroke()
         ring.stroke()
-        let amount = completed ? 1 : progress.isFinite ? min(1, max(0, progress)) : 0
+        let amount = completed ? 1 : collecting ? 0.22 : progress.isFinite ? min(1, max(0, progress)) : 0
         if amount > 0 {
             let arc = NSBezierPath()
             arc.lineWidth = 2
             arc.lineCapStyle = .round
-            arc.appendArc(withCenter: center, radius: 20, startAngle: 90,
-                          endAngle: 90 - CGFloat(amount) * 360, clockwise: true)
+            let start: CGFloat = collecting && !completed ? 90-CGFloat(ProcessInfo.processInfo.systemUptime.truncatingRemainder(dividingBy:2))*180 : 90
+            arc.appendArc(withCenter: center, radius: 20, startAngle: start,
+                          endAngle: start - CGFloat(amount) * 360, clockwise: true)
             feedbackColor.withAlphaComponent(0.95).setStroke()
             arc.stroke()
         }
@@ -515,6 +574,8 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
     let eyeSetupStack = NSStackView()
     var cameraStack: NSStackView?
     var eyeSetupExpanded = true
+    let gazeEyes = NSPopUpButton()
+    var gazeEyesPending = false
     let eyeSetupToggle = NSButton(title: "Camera setup ▾", target: nil, action: nil)
     let leftCameraChoice = NSPopUpButton(frame: .zero, pullsDown: false)
     let rightCameraChoice = NSPopUpButton(frame: .zero, pullsDown: false)
@@ -552,6 +613,9 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
     var timer: Timer?
     var animationTimer: Timer?
     var motion = GazeMotion()
+    var eyeMotions = ["left": GazeMotion(), "right": GazeMotion()]
+    var eyeDots: [String: DotPanel] = [:]
+    var eyeIdentities: [String: String] = [:]
     var readoutMotion = MeasurementChannels()
     private var readoutContext = ""
     var calibrationOrbit = CalibrationOrbit()
@@ -619,9 +683,12 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
         calibrationSteps.actionButton.action = #selector(continueCalibration)
         calibrationSteps.manualButton.target = self
         calibrationSteps.manualButton.action = #selector(alignWithCursor)
+        calibrationSteps.headButton.target = self
+        calibrationSteps.headButton.action = #selector(practiceHeadMovement)
         accuracyButton.target = self; accuracyButton.action = #selector(checkAccuracy)
         previewAlignButton.target = self
         previewAlignButton.action = #selector(alignWithPreview)
+        previewAlignButton.isHidden = true
         configureDiagnosticsLayout()
         dot.isOpaque = false
         dot.backgroundColor = .clear
@@ -630,7 +697,17 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
         dot.hidesOnDeactivate = false
         dot.level = .screenSaver
         dot.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
-        dot.contentView = DotView(frame: NSRect(x: 0, y: 0, width: 16, height: 16))
+        let combinedDot = DotView(frame: NSRect(x: 0, y: 0, width: 16, height: 16))
+        dot.contentView = combinedDot
+        for (side,color) in [("left",NSColor.systemPink),("right",NSColor.systemOrange)] {
+            let panel = DotPanel(contentRect:NSRect(x:0,y:0,width:24,height:24),
+                styleMask:[.borderless,.nonactivatingPanel],backing:.buffered,defer:false)
+            panel.isOpaque = false; panel.backgroundColor = .clear; panel.hasShadow = false
+            panel.ignoresMouseEvents = true; panel.hidesOnDeactivate = false; panel.level = .screenSaver
+            panel.collectionBehavior = [.canJoinAllSpaces,.fullScreenAuxiliary,.ignoresCycle]
+            let view = DotView(frame:NSRect(origin:.zero,size:panel.frame.size));view.color = color;view.ring = true
+            panel.contentView = view;eyeDots[side] = panel
+        }
         cursorReference.isOpaque = false
         cursorReference.backgroundColor = .clear
         cursorReference.hasShadow = false
@@ -756,23 +833,27 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
         // enabled and disabled. The action waits for a usable state below.
         previewAlignButton.isEnabled = true
         calibrateMenu.isEnabled = ready && !changing
-        cursorAlignMenu.isEnabled = fresh && !changing && hybrid && lastState?.onboarding?.phase != "no_displays"
-        let practicing = lastState?.onboarding?.cursor_calibration?.active == true && lastState?.onboarding?.cursor_calibration?.stage == "geometry"
-        headPracticeMenu.title = practicing ? "Stop head calibration" : "Calibrate head movement"
+        calibrateMenu.title = lastState?.onboarding?.phase == "idle" ? "Start calibration" : "Restart calibration"
+        cursorAlignMenu.isEnabled = fresh && !changing && hybrid && !["no_displays","waiting","fitting","head","screen","motion","verify","refine"].contains(lastState?.onboarding?.phase ?? "")
+        let practicing = lastState?.onboarding?.phase != "motion" && lastState?.onboarding?.cursor_calibration?.active == true && lastState?.onboarding?.cursor_calibration?.stage == "geometry"
+        let continuousHead = practicing && lastState?.onboarding?.geometry_calibration?.continuous == true
+        headPracticeMenu.title = practicing ? (continuousHead ? "Finish head calibration" : "Stop head calibration") : "Calibrate head movement"
         headPracticeMenu.isEnabled = fresh && !changing && !active && hybrid && lastState?.calibrated == true &&
             (lastState?.onboarding?.cursor_calibration?.active != true || practicing)
-        cursorAlignMenu.title = practicing ? "Stop head calibration" : lastState?.onboarding?.cursor_calibration?.active == true ? "Finish cursor alignment" : "Align with cursor"
+        calibrationSteps.headButton.title = headPracticeMenu.title
+        calibrationSteps.headButton.isEnabled = headPracticeMenu.isEnabled
+        cursorAlignMenu.title = practicing ? headPracticeMenu.title : lastState?.onboarding?.phase != "motion" && lastState?.onboarding?.cursor_calibration?.active == true ? "Finish cursor alignment" : "Align with cursor"
         calibrationSteps.actionButton.isEnabled = fresh && !changing && lastState?.onboarding != nil &&
             lastState?.onboarding?.phase != "no_displays"
         calibrationSteps.manualButton.isEnabled = cursorAlignMenu.isEnabled
         accuracyButton.isEnabled = fresh && !changing && cursorSession?.active != true &&
             ["complete", "verify"].contains(lastState?.onboarding?.phase ?? "")
-        accuracyButton.title = lastState?.onboarding?.phase == "verify" ? "Stop accuracy check" : "Check accuracy"
+        accuracyButton.title = lastState?.onboarding?.phase == "verify" ? "Stop accuracy check" : "Learn from dots"
         let report = lastState?.onboarding?.accuracy_check
         if let report = report {
             let result = report.mean_error_points.map { String(format: "Mean %.0f pt · Worst %.0f pt", $0, report.worst_error_points ?? $0) } ?? "No measurements yet"
             accuracySummary.stringValue = "\(report.status.capitalized) · \(report.rows.filter { $0.samples > 0 }.count)/\(report.target_count) measured\n\(result)\nOn laptop: filled = measured, ring = pending, cross = missing. Orange = estimate.\nErrors in screen points."
-        } else { accuracySummary.stringValue = "Accuracy not checked for this mapping.\nCheck again after alignment." }
+        } else { accuracySummary.stringValue = "No accuracy result for this mapping.\nLearn from dots records known target positions." }
 
         calibrateMenu.toolTip = nil
         clearEyeRegion.isHidden = active || changing || lastState?.eye_region == nil
@@ -864,7 +945,7 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
     @objc func checkAccuracy() {
         guard !changing else { return }
         changing = true
-        let path = lastState?.onboarding?.phase == "verify" ? "/onboarding/stop" : "/onboarding/accuracy-start"
+        let path = lastState?.onboarding?.phase == "verify" ? "/onboarding/stop" : "/onboarding/learn-dots"
         request(path, body: [:]) { [weak self] error in
             self?.changing = false; self?.localError = error
         }
@@ -873,10 +954,10 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
     @objc func continueCalibration() {
         guard !changing, Date().timeIntervalSince(lastReply) <= 0.6,
               let flow = lastState?.onboarding else { return }
-        if flow.cursor_calibration?.active == true || flow.phase == "complete" {
+        if (flow.cursor_calibration?.active == true && flow.phase != "motion") || flow.phase == "complete" {
             alignWithCursor(); return
         }
-        if ["waiting", "fitting", "head", "screen", "verify"].contains(flow.phase) {
+        if ["waiting", "fitting", "head", "screen", "motion", "verify", "refine"].contains(flow.phase) {
             changing = true; localError = nil
             request("/onboarding/stop", body: [:]) { [weak self] error in
                 guard let self = self else { return }
@@ -987,7 +1068,7 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
     }
 
     func sampleSystemCursor(_ state: TrackerState) {
-        guard state.onboarding?.cursor_calibration?.active == true, !changing, !cursorSamplePending,
+        guard state.onboarding?.phase != "motion", state.onboarding?.cursor_calibration?.active == true, !changing, !cursorSamplePending,
               Date().timeIntervalSince(lastCursorSample) >= 0.1,
               let screen = calibrationScreen() else { return }
         let mouse = alignmentTarget(state.onboarding!.cursor_calibration!, screen: screen, mouse: NSEvent.mouseLocation)
@@ -1003,7 +1084,7 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
     }
 
     func renderOnboarding(_ flow: OnboardingState) {
-        let showing = ["fitting", "head", "screen", "verify"].contains(flow.phase)
+        let showing = ["fitting", "head", "screen", "motion", "verify", "refine"].contains(flow.phase)
         guard showing, let screen = NSScreen.screens.first(where: {
             ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.stringValue == flow.display_id
         }) else {
@@ -1020,7 +1101,7 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
         // calibration session starts a fresh ring. Sampling still validates each fixation.
         calibrationFeedback.update(key: key, progress: flow.progress,
                                    accepted: flow.sample_accepted ?? (lastState?.valid ?? false))
-        surface.headCue = flow.phase == "head" ? flow.head_cue : nil
+        surface.headCue = flow.phase == "motion" ? "both" : flow.phase == "head" ? flow.head_cue : nil
         surface.progress = calibrationFeedback.progress
         surface.accepted = calibrationFeedback.accepted
         if flow.screen_path == "quick" {
@@ -1078,6 +1159,16 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
             self.restore()
         }
     }
+    @objc func changeGazeEyes() {
+        guard !gazeEyesPending else { return }
+        gazeEyesPending = true; gazeEyes.isEnabled = false
+        hideCursor()
+        let mode = ["both", "left", "right"][max(0,min(2,gazeEyes.indexOfSelectedItem))]
+        request("/gaze-eyes", body: ["mode":mode]) { [weak self] error in
+            self?.gazeEyesPending = false; self?.localError = error
+        }
+    }
+
     @objc func changeThreshold() {
         let value = (thresholdSlider.doubleValue * 100).rounded() / 100
         thresholdValue.stringValue = String(format: "%.2f", value)
@@ -1096,9 +1187,10 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
         if state.calibrated { return "Calibration complete" }
         if !state.camera_connected { return "Waiting for eye camera" }
         switch state.onboarding?.phase {
+        case "idle": return "Ready to calibrate"
         case "paused": return "Calibration incomplete"
         case "cancelled": return "Calibration cancelled"
-        case "fitting", "head", "screen", "verify", "cursor": return "Calibrating"
+        case "fitting", "head", "screen", "motion", "verify", "refine", "cursor": return "Calibrating"
         default: return "Waiting for calibration"
         }
     }
@@ -1247,9 +1339,12 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
         calibrationEyeStatus.textColor = .secondaryLabelColor
         add(calibrationEyeStatus, height: 44)
         // Reserve status space so live text never shifts the webcam below it.
+        title("Cursor eyes")
+        gazeEyes.addItems(withTitles: ["Both eyes", "Left eye only", "Right eye only"])
+        gazeEyes.target = self; gazeEyes.action = #selector(changeGazeEyes)
+        add(gazeEyes, height: 26)
         title("Tracking controls")
         add(diagnosticText, height: 20)
-        if hybrid { previewAlignButton.bezelStyle = .rounded; add(previewAlignButton, height: 28) }
         add(clearEyeRegion, height: 28)
         if hybrid {
             title("Webcam status")
@@ -1329,7 +1424,11 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
         secondaryEyeStatus.toolTip = rig.eyes["right"]?.error ?? secondaryEyeStatus.stringValue
         if rig.eyes["left"]?.connected != true { preview.image = nil }
         if rig.eyes["right"]?.connected != true { secondaryEyePreview.image = nil }
-        calibrationEyeStatus.stringValue = "EyeCursor calibration uses the \(rig.active_eye) eye. The 3D view shows both camera directions."
+        calibrationEyeStatus.stringValue = "Both eyes are detected independently. Coloured beams follow their calibrated screen dots."
+        if !gazeEyesPending {
+            gazeEyes.selectItem(at: ["both","left","right"].firstIndex(of:lastState?.gaze_eye_mode ?? "both") ?? 0)
+            gazeEyes.isEnabled = !active && lastState?.onboarding?.cursor_calibration?.active != true
+        }
         updateEyeSelection(primary: rig.active_eye)
         guard !eyeSetupPending else { return }
         let devices = rig.devices.sorted { $0.id < $1.id }
@@ -1568,18 +1667,45 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
     func hideCursor() {
         motion.reset()
         dot.orderOut(nil)
+        angleDebugger.followDisplayedCursor(nil)
     }
 
     func loseCursorTracking() {
+        if Date().timeIntervalSince(lastReply) > 0.6 {
+            for side in ["left","right"] { eyeMotions[side]?.loseTracking(at:ProcessInfo.processInfo.systemUptime) }
+        }
         motion.loseTracking(at: ProcessInfo.processInfo.systemUptime)
         animateCursor()
     }
 
     func animateCursor(at time: Double = ProcessInfo.processInfo.systemUptime) {
-        guard let sample = motion.sample(at: time),
+        // Draw the scene after publishing this frame's displayed cursor point.
+        defer { angleDebugger.animate(at:time) }
+        let combinedSample = motion.sample(at:time)
+        var displayedEyes: [String: ([Double],Double)] = [:]
+        for side in ["left","right"] {
+            let eyeSample = eyeMotions[side]?.sample(at:time)
+            guard eyeSample != nil, let sample = eyeSample,
+                  let center = desktopFence(sample,frames:NSScreen.screens.map { $0.frame }),
+                  let primary = NSScreen.screens.first else { eyeDots[side]?.orderOut(nil); continue }
+            let opacity = eyeMotions[side]?.opacity ?? 0
+            displayedEyes[side] = ([Double(center.x),Double(primary.frame.maxY-center.y)],opacity)
+            if angleDebugger.separateEyes.state == .on && !active && !eyeSetupPending && lastState?.calibrated == true && lastState?.desktop_cursor == true {
+                eyeDots[side]?.alphaValue = opacity
+                let radius = (eyeDots[side]?.frame.width ?? 18)/2
+                eyeDots[side]?.setFrameOrigin(NSPoint(x:center.x-radius,y:center.y-radius))
+                eyeDots[side]?.orderFrontRegardless()
+            } else { eyeDots[side]?.orderOut(nil) }
+        }
+        angleDebugger.followDisplayedEyes(displayedEyes)
+        guard let sample = combinedSample,
               let center = desktopFence(sample, frames: NSScreen.screens.map { $0.frame }) else {
             dot.orderOut(nil)
+            angleDebugger.followDisplayedCursor(nil)
             return
+        }
+        if let primary = NSScreen.screens.first {
+            angleDebugger.followDisplayedCursor([Double(center.x),Double(primary.frame.maxY-center.y)],opacity:motion.opacity)
         }
         dot.alphaValue = motion.opacity
         dot.setFrameOrigin(NSPoint(x: center.x - 8, y: center.y - 8))
@@ -1590,7 +1716,7 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
         guard Date().timeIntervalSince(lastReply) <= 0.6 else {
             cursorReference.orderOut(nil); return
         }
-        guard let session = lastState?.onboarding?.cursor_calibration, session.active,
+        guard lastState?.onboarding?.phase != "motion", let session = lastState?.onboarding?.cursor_calibration, session.active,
               let screen = calibrationScreen() else {
             cursorReferenceFeedback.reset()
             cursorReference.orderOut(nil); return
@@ -1605,8 +1731,12 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
                                     y: screen.frame.maxY - saved[1]*screen.frame.height)
             moved = hypot(target.x-savedPoint.x, target.y-savedPoint.y) > 5
         }
-        cursorReferenceSurface.completed = session.target_complete == true && !moved
-        if moved {
+        let continuous = session.stage == "geometry" && lastState?.onboarding?.geometry_calibration?.continuous == true
+        cursorReferenceSurface.collecting = continuous
+        cursorReferenceSurface.completed = continuous ? lastState?.onboarding?.geometry_calibration?.applied == true : session.target_complete == true && !moved
+        if continuous {
+            cursorReferenceFeedback.reset()
+        } else if moved {
             cursorReferenceFeedback.reset()
         } else {
             let key = "\(lastState?.onboarding?.calibration_session_id ?? "")|\(lastState?.onboarding?.display_id ?? "")|\(session.stage ?? "")|\(session.fixed_target ?? session.target_position ?? [])"
@@ -1614,7 +1744,7 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
                                            accepted: session.sample_accepted ?? (lastState?.valid == true))
         }
         cursorReferenceSurface.progress = cursorReferenceFeedback.progress
-        cursorReferenceSurface.accepted = cursorReferenceFeedback.accepted
+        cursorReferenceSurface.accepted = continuous ? session.sample_accepted == true : cursorReferenceFeedback.accepted
         cursorReference.setFrameOrigin(NSPoint(x: target.x - 48, y: target.y - 70))
         if !cursorReference.isVisible { cursorReference.orderFrontRegardless() }
     }
@@ -1676,7 +1806,6 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
         guard diagnosticWindow.isVisible, Date().timeIntervalSince(lastReply) <= 0.6,
               let state = lastState else { return }
         let time = ProcessInfo.processInfo.systemUptime
-        angleDebugger.animate(at: time)
         renderMeasurements(state, at: time)
     }
 
@@ -1707,7 +1836,15 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
         renderEyeSetup(state.eye_cameras)
         sampleSystemCursor(state)
         calibrationSteps.update(state.onboarding)
+        let eyeTime = ProcessInfo.processInfo.systemUptime
         angleDebugger.update(state)
+        for side in ["left","right"] {
+            if let prediction = state.eye_predictions?[side],prediction.desktop.count == 2,
+               prediction.desktop.allSatisfy({ $0.isFinite }),let primary = NSScreen.screens.first {
+                if eyeIdentities[side] != prediction.identity { eyeMotions[side]?.reset();eyeIdentities[side] = prediction.identity }
+                eyeMotions[side]?.updateTarget(NSPoint(x:prediction.desktop[0],y:primary.frame.maxY-prediction.desktop[1]),at:eyeTime)
+            } else { eyeMotions[side]?.loseTracking(at:eyeTime) }
+        }
         if let threshold = state.detection_threshold, !thresholdPending, threshold != serverThreshold {
             serverThreshold = threshold
             thresholdSlider.doubleValue = threshold
@@ -1727,7 +1864,7 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
                     (!head.face_visible ? "Face not visible." : !state.calibrated ? "Head tracked · Screen estimate available after calibration." :
                      state.desktop_gaze == nil ? (state.cursor_message ?? "Waiting for a mapped gaze position.") : "Lines and trail show the combined cursor estimate on the screen map."))
                 if head.connected && head.face_visible {
-                    let correction = state.onboarding?.geometry_model != nil ? "head rotation and position model active" : state.onboarding?.head_mode == "steady" ? "steady-head mode; use fixed-dot head calibration" :
+                    let correction = state.onboarding?.head_correction_status == "empirical" ? "measured head correction active" : state.onboarding?.geometry_model != nil ? "head rotation and position model active" : state.onboarding?.head_mode == "steady" ? "steady-head mode; use fixed-dot head calibration" :
                         state.onboarding?.head_ready == true ? "ready" : "not calibrated"
                     faceText.stringValue = "Head correction: \(correction) · Webcam iris marks are landmarks, not screen gaze.\n" +
                         (state.calibrated ? (state.cursor_message ?? "") : "Initial anchors: \(state.onboarding?.screen_sectors ?? 0)/4 corners captured.")
@@ -1750,7 +1887,7 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
         }
         let center = NSPoint(x: point[0], y: primary.frame.maxY - point[1])
         guard NSScreen.screens.contains(where: { $0.frame.contains(center) }) else { loseCursorTracking(); return }
-        motion.updateTarget(center, at: ProcessInfo.processInfo.systemUptime)
+        motion.updateTarget(center, at:time)
         animateCursor()
         if let click = state.click_event, click.id > lastClickID {
             lastClickID = click.id  // Never replay an event skipped while a menu or permission is open.

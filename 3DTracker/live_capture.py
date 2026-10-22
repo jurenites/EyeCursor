@@ -3,10 +3,13 @@ import time
 
 
 class ReconnectingCapture:
-    def __init__(self, opener, clock=time.monotonic, recovery_seconds=3.0):
+    def __init__(self, opener, clock=time.monotonic, recovery_seconds=3.0, warmup_seconds=None):
         self.opener = opener
         self.clock = clock
         self.recovery_seconds = recovery_seconds
+        self.warmup_seconds = recovery_seconds if warmup_seconds is None else warmup_seconds
+        self.received_frame = False
+        self.frame_time = None
         self.capture = None
         self.last_frame_at = clock()
         self.next_attempt_at = self.last_frame_at
@@ -16,6 +19,7 @@ class ReconnectingCapture:
         self._open()
 
     def _open(self):
+        self.received_frame = False
         try:
             self.capture = self.opener()
         except (ValueError, RuntimeError):
@@ -43,12 +47,16 @@ class ReconnectingCapture:
                 return False, None
         ok, frame = self.capture.read()
         if ok and frame is not None and frame.size:
+            self.received_frame = True
+            stamp=getattr(self.capture,'frame_time',None)
+            self.frame_time=stamp if isinstance(stamp,(int,float)) else self.clock()
             self.last_frame_at = self.clock()
             self.retry_delay = 1.0
             self.recovered = self.reopened
             self.reopened = False
             return True, frame
-        if self.clock() - self.last_frame_at >= self.recovery_seconds:
+        limit=self.recovery_seconds if self.received_frame else self.warmup_seconds
+        if self.clock() - self.last_frame_at >= limit:
             self._schedule_retry()
         return False, None
 

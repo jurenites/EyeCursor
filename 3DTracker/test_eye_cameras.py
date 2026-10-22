@@ -36,6 +36,42 @@ class EyeCameraTests(unittest.TestCase):
     def publish(self, eye, frame=None):
         self.rig._publish(eye, self.rig.config[eye], self.frame if frame is None else frame, self.now)
 
+    def test_numeric_pair_history_survives_hold_but_rejects_stale_or_reassigned_samples(self):
+        for side in ('left','right'):
+            self.publish(side)
+            sample=self.rig.snapshot(side)
+            result={'pupil_ellipse':{'center':[320,240]},'confidence':.9,
+                    'head_pose':{'features':[0,0,0,.5,.4,-1.2],'time':self.now,'epoch':1}}
+            self.rig.remember_observation(side,sample,result,.5)
+        self.now+=1
+        # Delayed commit of a successful fixation retrieves the original pair.
+        pair=self.rig.observations_at(10)
+        self.assertEqual(set(pair),{'left','right'})
+        self.assertEqual(pair['right']['eye'],[.5,.5])
+        self.assertEqual(self.rig.observations_at(self.now),{})
+        self.assertNotIn('jpeg',pair['left'])
+        config=copy.deepcopy(self.config);config['right']['rotation']=180
+        self.rig.configure(config)
+        self.assertEqual(set(self.rig.observations_at(10)),{'left'})
+        # A delayed detector callback from the old orientation cannot repopulate history.
+        self.rig.remember_observation('right',sample,result,.5)
+        self.assertEqual(set(self.rig.observations_at(10)),{'left'})
+
+    def test_raster_hold_is_prediction_only_and_never_adds_training_history(self):
+        self.publish('right');sample=self.rig.snapshot('right')
+        row={'confidence':.1,'pupil_ellipse':{'center':[350,210]},
+             'head_pose':{'features':[0,0,0,.5,.4,-1.2],'time':10.,'epoch':1},
+             'display_hold':{'pupil_ellipse':{'center':[320,240]},'confidence':.9,
+                             'measured_at':9.95,'held_until':10.07}}
+        self.rig.publish_tracking('right',sample,row,b'preview',.5)
+        self.assertEqual(self.rig.observations_at(10.),{})
+        held=self.rig.prediction_observations_at(10.)['right']
+        self.assertTrue(held['held']);self.assertEqual(held['eye'],[.5,.5])
+        self.assertEqual(self.rig.prediction_observations_at(10.08),{})
+        changed=copy.deepcopy(self.config);changed['right']['rotation']=180
+        self.rig.configure(changed)
+        self.assertEqual(self.rig.prediction_observations_at(10.),{})
+
     def test_left_rotates_before_tracking_right_keeps_original_pixels(self):
         self.publish('left')
         self.publish('right')
@@ -248,6 +284,7 @@ class EyeCameraTests(unittest.TestCase):
             self.rig.publish_tracking(eye, self.rig.snapshot(eye), result, b'jpg', .5)
         directions = self.rig.status()['eyes']
         self.assertEqual(directions['left']['scene_direction']['head_features'], pose)
+        self.assertEqual(directions['left']['scene_direction']['captured_at'], self.rig.snapshot('left')['time'])
         self.assertEqual(directions['right']['scene_direction']['vector'], [.1, .2, .97])
         for invalid in (dict(result, confidence=.1), dict(result, eye_model_estimated=False),
                         dict(result, head_pose=None), dict(result, gaze_direction=[0, 0, 0]),
@@ -261,6 +298,20 @@ class EyeCameraTests(unittest.TestCase):
         self.assertIsNone(self.rig.status()['eyes']['right']['scene_direction'], 'Old-session rays must disappear immediately')
         self.now += .6
         self.assertTrue(all(slot['scene_direction'] is None for slot in self.rig.status()['eyes'].values()))
+
+    def test_companion_has_its_own_frozen_model_and_preview_arrow_readiness(self):
+        calibration=Calibration('Left eye camera');calibration.eye_cameras=self.rig
+        detector=Mock();detector.get_last_tracking_result.return_value=None
+        render=Mock(side_effect=lambda frame,result,**kwargs:frame)
+        worker=CompanionEyeTracker(calibration,render,detector)
+        self.publish('right');worker.process_next()
+        self.assertEqual(worker.eye_model.phase,'collecting')
+        self.assertFalse(render.call_args.kwargs['eye_model_ready'])
+        worker.eye_model.phase='ready'
+        self.now+=.04;self.publish('right');worker.process_next()
+        self.assertTrue(render.call_args.kwargs['eye_model_ready'])
+        self.assertFalse(detector.eye_sphere_adjustment_enabled)
+        self.assertEqual(calibration.eye_model.phase,'uncalibrated','Models must not share readiness')
 
     def test_companion_pairs_head_to_its_own_capture_time(self):
         calibration = Calibration('Left eye camera')

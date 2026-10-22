@@ -38,6 +38,10 @@ class ScreenGazeTests(unittest.TestCase):
         self.assertTrue(all(a[0] <= b[0] <= 1700 and a[1] <= b[1] <= 900
                             for a, b in zip(samples, samples[1:])))
 
+    def test_confirmed_move_reaches_near_target_without_long_filter_tail(self):
+        samples=[self.update((1700,900),i/30) for i in range(1,7)]
+        self.assertLess(np.linalg.norm(np.asarray(samples[-1])-[1700,900]),30)
+
     def test_erratic_far_candidates_expire_instead_of_chasing_them(self):
         for i in range(1, 20):
             point = (100, 100) if i % 2 else (1800, 1000)

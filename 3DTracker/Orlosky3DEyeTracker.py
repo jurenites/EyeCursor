@@ -37,6 +37,8 @@ minimum_intersection_angle_degrees = 8  # Minimum angle between sampled rays
 last_tracking_result = None
 _iris_search_pupil = None  # Store the latest tracker output
 _pupil_track = PupilTrack()
+from raster_hold import RasterHold
+_raster_hold = RasterHold()
 eye_region = None  # Optional normalized eye-only search area, set by EyeCursor.
 DISPLAY_ENABLED = True
 
@@ -659,6 +661,7 @@ def reset_tracking_state():
     stuck_ellipses = []
     _iris_search_pupil = None
     _pupil_track.reset()
+    _raster_hold.reset()
     last_tracking_result = None
 
 def get_last_tracking_result():
@@ -897,6 +900,16 @@ def draw_stuck_ellipses(frame):
 
 # Finds the pupil in an individual frame and returns the center point
 def process_frame(frame, timestamp=None):
+    global last_tracking_result
+    stamp=time.monotonic() if timestamp is None else timestamp
+    # Keep pixels before legacy rendering annotates its working frame.
+    raster=crop_to_aspect_ratio(frame).copy()
+    ellipse=_process_frame(frame,timestamp=stamp)
+    last_tracking_result=_raster_hold.update(raster,last_tracking_result,stamp,pupil_confidence_threshold)
+    return ellipse
+
+
+def _process_frame(frame, timestamp=None):
     global _iris_search_pupil, last_tracking_result
 
     timestamp = time.monotonic() if timestamp is None else timestamp

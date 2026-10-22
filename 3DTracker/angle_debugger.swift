@@ -147,13 +147,21 @@ final class AngleDebugger: NSObject, SCNSceneRendererDelegate {
     let metrics = NSTextField(wrappingLabelWithString: "")
     let mappingMetrics = NSTextField(wrappingLabelWithString: "")
     let cameraRayMetrics = NSTextField(wrappingLabelWithString: "")
+    let separateEyes = MonochromeCheckbox(checkboxWithTitle: "Show both eye cursors", target: nil, action: nil)
+    var displayedEyes: [String: ([Double],Double)]? = nil
+    func followDisplayedEyes(_ points: [String: ([Double],Double)]) { displayedEyes = points }
+    let rawDirections = MonochromeCheckbox(checkboxWithTitle: "Show raw camera directions", target: nil, action: nil)
+    private var usesDisplayedCursor = false
+    private var displayedCursor: [Double]?
+    private var cursorOpacity: CGFloat = 1
     private var cameraMeasurements = MeasurementChannels()
+    // A visualization scale, not the gaze calibration reference. Capturing a
+    // target must not teleport an otherwise unchanged face.
+    private var sceneReferenceWidth: Double?
+    private var sceneReferenceCamera: String?
     private var cameraContexts: [String: String] = [:]
     var savedReferences: [CalibrationRay] = []
-    var referenceOrigins: [Int:SIMD3<Float>] = [:]
-    var rayQuality: Float = 0
-    private var lastRayTime: Double?
-    private let metricLabels = ["Angular difference", "Plane miss", "Tracking eye", "IR center", "Pupil offset"]
+    private let metricLabels = ["Camera mounting", "Raw ray", "Tracking eye", "IR center", "Pupil offset"]
     private var lastMetricRows: [String?] = Array(repeating: nil, count: 5)
     let targetMode = MonochromeCheckbox(checkboxWithTitle: "Follow calibration target", target: nil, action: nil)
     private let preferences: UserDefaults
@@ -243,12 +251,16 @@ final class AngleDebugger: NSObject, SCNSceneRendererDelegate {
         caption("Angle laboratory", bold: true)
         caption("Drag to orbit, scroll to zoom. The scene shows your connected monitors. The calibration dot stays above this window.")
         metrics.font = .monospacedDigitSystemFont(ofSize: 11,weight: .regular); add(metrics)
+        mappingMetrics.font = .monospacedDigitSystemFont(ofSize: 11,weight: .regular)
+        mappingMetrics.textColor = .secondaryLabelColor; add(mappingMetrics)
+        mappingMetrics.heightAnchor.constraint(equalToConstant: 112).isActive = true
         cameraRayMetrics.font = .monospacedDigitSystemFont(ofSize: 11,weight: .regular)
         add(cameraRayMetrics)
         cameraRayMetrics.heightAnchor.constraint(equalToConstant: 74).isActive = true
-        mappingMetrics.font = .monospacedDigitSystemFont(ofSize: 11,weight: .regular)
-        mappingMetrics.textColor = .secondaryLabelColor; add(mappingMetrics)
-        mappingMetrics.heightAnchor.constraint(equalToConstant: 42).isActive = true
+        rawDirections.state = .on
+        rawDirections.target = self; rawDirections.action = #selector(changed)
+        add(rawDirections)
+        add(separateEyes)
         // Live samples may disappear between frames. Keep the controls below
         // these labels stationary regardless of text wrapping or availability.
         metrics.heightAnchor.constraint(equalToConstant: 90).isActive = true
@@ -294,7 +306,7 @@ final class AngleDebugger: NSObject, SCNSceneRendererDelegate {
         control("px", "Fitted center X (px)",0,-80,80); control("py", "Fitted center Y (px)",0,-80,80)
         caption("IR MOUNT / ANGLE OFFSETS · degrees")
         control("yaw", "Yaw",0,-90,90); control("pitch", "Pitch",0,-90,90); control("roll", "Roll",0,-180,180)
-        caption("Magenta = left IR camera. Orange = right IR camera. Small matching dots mark their estimated screen-plane intersections; X/Y are percentages from the laptop screen’s top-left, including off-screen values. These are independent, approximate directions, not two cursor targets. Missing measurements hide only that camera’s ray. Green = the existing single EyeCursor estimate. Red = its last direction while tracking is unavailable. Blue = webcam iris estimates. Bright white = current eye-to-target reference; faint white = previous accepted measurements.\n\nHead depth, eye centers and camera mounting are approximate. Calibration learns the screen map; it does not measure anatomical eye centers. Controls affect this view only.")
+        caption("Pink = left eye; orange = right eye. Each beam joins the estimated eye position to that eye’s displayed screen dot. White is the combined cursor. These beams visualize the calibrated screen maps; eye depth is approximate. Off-screen estimates are fenced to the display edge, not claimed as accurate hits.\n\nRaw camera directions appear as short gray stubs; blue lines are webcam estimates. Their mounting geometry is uncalibrated and does not drive the cursor.")
         restoreSettings(); refreshDisplays(); updateLabels(); rebuild(); setView()
     }
     func installCalibrationSteps(_ view: NSView) {
@@ -434,6 +446,11 @@ final class AngleDebugger: NSObject, SCNSceneRendererDelegate {
         return center + rotation.act([Float((desktop.x-display.frame.midX)/display.frame.width)*w,
                                        Float((desktop.y-display.frame.midY)/display.frame.height)*h,0.08])
     }
+    func followDisplayedCursor(_ point: [Double]?, opacity: CGFloat = 1) {
+        usesDisplayedCursor = true
+        displayedCursor = validMeasurement(point, count: 2)
+        cursorOpacity = max(0,min(1,opacity))
+    }
     func update(_ state: TrackerState, at time: Double = ProcessInfo.processInfo.systemUptime) {
         let context = "\(state.eye_camera_id ?? state.source):\(state.eye_cameras?.active_eye ?? "right"):\(state.eye_cameras?.eyes[state.eye_cameras?.active_eye ?? "right"]?.rotation ?? 0):\(state.head_camera?.name ?? ""):\(state.onboarding?.display_id ?? ""):\(state.calibrated)"
         if context != measurementContext { measurements.reset(); measurementContext = context }
@@ -447,6 +464,7 @@ final class AngleDebugger: NSObject, SCNSceneRendererDelegate {
                     checked["rotation"] == true ? "Head: turns checked; shifts pending" :
                     checked["translation"] == true ? "Head: shifts checked; turns pending" : "Head: motion partly checked"
             } else { headStatus = "Head: geometric model active" }
+        case "empirical": headStatus = "Head: measured correction; refinement available"
         case "inconsistent": headStatus = "Head model: inconsistent fit; local only"
         case "insufficient_repeats": headStatus = "Head model: repeat a target at new poses"
         case "insufficient_motion": headStatus = "Head model: no clear movement measured"
@@ -454,6 +472,16 @@ final class AngleDebugger: NSObject, SCNSceneRendererDelegate {
         default: headStatus = "Learned head directions: \(state.onboarding?.head_correction_rank ?? 0)"
         }
         mappingMetrics.stringValue = "Accepted samples: \(savedReferences.count)\n\(headStatus)"
+        mappingMetrics.stringValue += "\nScreen estimates · \(state.gaze_eye_mode ?? "both")"
+        for side in ["left", "right"] {
+            if let estimate = state.eye_predictions?[side], estimate.uv.count == 2 {
+                let outside = estimate.uv.contains { $0 < 0 || $0 > 1 }
+                mappingMetrics.stringValue += String(format:"\n\(side.capitalized): %.1f%%, %.1f%%%@",estimate.uv[0]*100,estimate.uv[1]*100,outside ? " · fenced at edge" : "")
+            } else {
+                let status = state.onboarding?.eye_map_status?[side]
+                mappingMetrics.stringValue += "\n\(side.capitalized): \(status == "Needs target samples" ? "use Learn from dots" : "waiting for paired estimate")"
+            }
+        }
         if let error = savedReferences.last?.error_px, error.isFinite {
             mappingMetrics.stringValue += String(format:"\nBefore last anchor: %.0f px miss",error)
         }
@@ -464,6 +492,12 @@ final class AngleDebugger: NSObject, SCNSceneRendererDelegate {
             return validMeasurement(state.eye_cameras?.eyes[side]?.scene_direction?.head_features, count: 6)
         }.first
         let head = paired ?? (state.head_camera?.face_visible == true ? validMeasurement(state.head_camera?.features, count: 6) : nil) ?? cameraHead
+        if let head = head {
+            let camera = state.head_camera?.name ?? "webcam"
+            if sceneReferenceWidth == nil || sceneReferenceCamera != camera {
+                sceneReferenceWidth = head[5]; sceneReferenceCamera = camera
+            }
+        }
         measurements.update("head", head, at: time)
         measurements.update("eye", paired != nil ? validMeasurement(eye?.vector, count: 3) : nil, at: time)
         measurements.update("center", paired != nil ? validMeasurement(eye?.center, count: 2) : nil, at: time)
@@ -472,6 +506,8 @@ final class AngleDebugger: NSObject, SCNSceneRendererDelegate {
         measurements.update("gaze", state.calibrated && (state.display_valid ?? state.valid) && validGaze ? state.gaze : nil, at: time)
         let raw = validMeasurement(state.unclamped_gaze ?? state.gaze, count: 2)
         measurements.update("rawGaze", state.valid && state.calibrated ? raw : nil, at: time)
+        measurements.update("desktopCursor", state.calibrated && (state.display_valid ?? state.valid)
+                            ? validMeasurement(state.desktop_gaze,count:2) : nil, at:time)
         for i in 0..<2 {
             let rays = state.head_camera?.eye_rays
             measurements.update("ray\(i)", head != nil && state.head_camera?.face_visible == true && rays?.count == 2 ? validMeasurement(rays?[i], count: 3) : nil, at: time)
@@ -497,6 +533,7 @@ final class AngleDebugger: NSObject, SCNSceneRendererDelegate {
     }
     func invalidate() {
         state = nil
+        displayedCursor = nil
         measurements.reset()
         cameraMeasurements.reset()
         if contentView.window?.isVisible == true { rebuild() }
@@ -529,13 +566,6 @@ final class AngleDebugger: NSObject, SCNSceneRendererDelegate {
     func value(_ key: String) -> Float { Float(sliders[key]!.doubleValue) }
     func updateLabels() {
         for (key,label) in values { label.stringValue = String(format: "%@: %.1f",label.identifier!.rawValue, value(key)) }
-        let fitted = state?.onboarding?.geometry_model
-        sliders["distance"]?.isEnabled = fitted == nil
-        sliders["ipd"]?.isEnabled = fitted == nil
-        if let fitted = fitted {
-            values["distance"]?.stringValue = String(format:"Fitted reference distance: %.1f cm",Float(fitted.depth_screen_widths)*value("width"))
-            values["ipd"]?.stringValue = String(format:"Model eye separation: %.1f cm",eyeSeparation())
-        }
         sliders["tx"]?.isEnabled = targetMode.state != .on || calibrationTarget() == nil
         sliders["ty"]?.isEnabled = sliders["tx"]?.isEnabled ?? true
     }
@@ -559,19 +589,16 @@ final class AngleDebugger: NSObject, SCNSceneRendererDelegate {
     }
     var trackingEyeSide: String { state?.eye_cameras?.active_eye ?? "right" }
     var trackingEyeSign: Float { trackingEyeSide == "left" ? -1 : 1 }
-    func eyeSeparation() -> Float {
-        state?.onboarding?.geometry_model.map { Float($0.eye_separation_screen_widths)*value("width") } ?? value("ipd")
-    }
+    func eyeSeparation() -> Float { value("ipd") }
     func headGeometry(_ features: [Double]) -> (SIMD3<Float>, simd_quatf) {
-        let calibrated = state?.onboarding?.geometry_model
-        let referenceWidth = calibrated?.reference_log_face_width ?? log(0.3)
-        let distance = calibrated.map { Float($0.depth_screen_widths)*value("width") } ?? value("distance")
+        let referenceWidth = sceneReferenceWidth ?? features[5]
+        let distance = value("distance")
         let depth = distance * Float(exp(max(-0.7,min(0.7,referenceWidth-features[5]))))
         let mount = simd_quatf(angle:value("camera_pitch") * .pi/180,axis:SIMD3<Float>(1,0,0))
         // A captured reference must not straighten a physically turned head.
         let rotation = mount * AngleGeometry.headRotation(features,relativeTo: [0,0,0,0,0,0])
         let midpoint = AngleGeometry.eyeMidpoint(imageUV:[Float(features[3]),Float(features[4])],depth:depth,
-            verticalFOV:value("camera_fov") * .pi/180,imageAspect:Float(calibrated?.camera_aspect ?? state?.head_camera?.image_aspect ?? 16.0/9.0),
+            verticalFOV:value("camera_fov") * .pi/180,imageAspect:Float(state?.head_camera?.image_aspect ?? 16.0/9.0),
             cameraOrigin:[value("hx"),value("width")/aspect/2+value("webcam")+value("hy"),0],
             cameraPitch:value("camera_pitch") * .pi/180)
         // The observed landmarks are the eye midpoint, not the skull center.
@@ -583,42 +610,93 @@ final class AngleDebugger: NSObject, SCNSceneRendererDelegate {
         return head+rotation.act([trackingEyeSign*eyeSeparation()/2+value("cx"),2+value("cy"),-5.8+value("cz")])
     }
 
+    struct CameraRay {
+        let origin: SIMD3<Float>
+        let direction: SIMD3<Float>
+    }
+    struct ScreenRayHit {
+        let point: SIMD3<Float>
+        let desktop: [Double]
+        let distance: Float
+    }
+    func cameraRay(_ side: String, at time: Double) -> CameraRay? {
+        guard let observation = cameraMeasurements.sample(side,at:time) else { return nil }
+        let local = AngleGeometry.unit(SIMD3<Float>(observation.prefix(3).map(Float.init)))
+        let (head,rotation) = headGeometry(Array(observation.suffix(6)))
+        let sign: Float = side == "left" ? -1 : 1
+        // Common rig offsets apply symmetrically; choosing a tracking eye cannot
+        // change the physical origin of either measured ray.
+        let origin = head+rotation.act([sign*eyeSeparation()/2+value("cx"),2+value("cy"),-5.8+value("cz")])
+        let mount = AngleGeometry.rotation(yaw:value("yaw") * .pi/180,
+            pitch:value("pitch") * .pi/180,roll:value("roll") * .pi/180)
+        let direction = AngleGeometry.unit(rotation.act(mount.act([-local.x,local.y,-local.z])))
+        return CameraRay(origin:origin,direction:direction)
+    }
+    func screenHit(_ ray: CameraRay) -> ScreenRayHit? {
+        guard let primary = NSScreen.screens.first else { return nil }
+        var nearest: ScreenRayHit?
+        for display in connectedDisplays {
+            let (center,rotation,w,h) = displayTransform(display)
+            let origin = rotation.inverse.act(ray.origin-center)
+            let direction = rotation.inverse.act(ray.direction)
+            guard let local = AngleGeometry.hit(origin,direction),
+                  abs(local.x)<=w/2,abs(local.y)<=h/2 else { continue }
+            let point = center+rotation.act(local)
+            let distance = simd_distance(ray.origin,point)
+            let desktop = [Double(display.frame.midX)+Double(local.x/w)*Double(display.frame.width),
+                Double(primary.frame.maxY-display.frame.midY)-Double(local.y/h)*Double(display.frame.height)]
+            if nearest == nil || distance<nearest!.distance {
+                nearest = ScreenRayHit(point:point,desktop:desktop,distance:distance)
+            }
+        }
+        return nearest
+    }
+    func cameraScreenHits(at time: Double) -> [String: ScreenRayHit] {
+        var hits: [String: ScreenRayHit] = [:]
+        for side in ["left","right"] {
+            if let ray = cameraRay(side,at:time),let hit = screenHit(ray) { hits[side] = hit }
+        }
+        return hits
+    }
+    func cameraScreenMidpoint(at time: Double) -> [Double]? {
+        let stamps = ["left","right"].compactMap { state?.eye_cameras?.eyes[$0]?.scene_direction?.captured_at }
+        if stamps.count == 2 && abs(stamps[0]-stamps[1])>0.12 { return nil }
+        let hits = cameraScreenHits(at:time)
+        guard let left = hits["left"],let right = hits["right"] else { return nil }
+        let point = zip(left.desktop,right.desktop).map { pair in (pair.0+pair.1)/2 }
+        // A midpoint in a gap between monitors is not a point on a screen.
+        return sceneDesktopPoint(point) != nil ? point : nil
+    }
+
     func drawCameraDirections(at time: Double, width: Float, height: Float) {
-        let text = NSMutableAttributedString(string: "IR screen plane · estimated X/Y\n", attributes: [
+        let showFull = rawDirections.state == .on
+        if !showFull {
+            cameraRayMetrics.stringValue = "Raw camera directions · hidden\nMounting angles are uncalibrated"
+            return
+        }
+        let text = NSMutableAttributedString(string: "Camera-local directions · mount unknown\n", attributes: [
             .font: cameraRayMetrics.font!, .foregroundColor: NSColor.secondaryLabelColor
         ])
-        let mount = AngleGeometry.rotation(yaw:value("yaw") * .pi/180,
-                                           pitch:value("pitch") * .pi/180,roll:value("roll") * .pi/180)
-        for (side, color) in [("left", NSColor.magenta), ("right", NSColor.systemOrange)] {
+        for (side, color) in [("left", NSColor.systemPink), ("right", NSColor.systemOrange)] {
             var row = "\(side.capitalized) IR: unavailable"
-            if let observation = cameraMeasurements.sample(side, at: time) {
-                let local = AngleGeometry.unit(SIMD3<Float>(observation.prefix(3).map(Float.init)))
-                let (head, rotation) = headGeometry(Array(observation.suffix(6)))
-                let sign: Float = side == "left" ? -1 : 1
-                let offset: SIMD3<Float> = side == trackingEyeSide ? [value("cx"),value("cy"),value("cz")] : .zero
-                let origin = head + rotation.act(SIMD3<Float>(sign*eyeSeparation()/2,2,-5.8) + offset)
-                let direction = AngleGeometry.unit(rotation.act(mount.act([-local.x,local.y,-local.z])))
-                let hit = AngleGeometry.hit(origin, direction)
-                let distance = hit.map { simd_distance(origin,$0) } ?? 80
-                line(origin,origin+direction*min(200,distance),alpha:0.9,radius:0.045,
-                     color:color,name:"ir-camera-ray-\(side)")
-                let start = ball(origin,0.20); start.name = "ir-camera-origin-\(side)"
-                start.geometry?.firstMaterial?.diffuse.contents = color
-                if let hit = hit {
-                    let x = (hit.x/width+0.5)*100, y = (0.5-hit.y/height)*100
-                    let outside = x < 0 || x > 100 || y < 0 || y > 100
-                    row = String(format:"\(side.capitalized) IR: %.1f%%, %.1f%%%@",x,y,outside ? " · outside" : "")
-                    if distance <= 200 {
-                        let marker = ball(hit,0.18); marker.name = "ir-camera-hit-\(side)"
-                        marker.geometry?.firstMaterial?.diffuse.contents = color
-                    }
-                } else { row = "\(side.capitalized) IR: no plane intersection" }
+            if let ray = cameraRay(side,at:time) {
+                let hit = screenHit(ray)
+                let plane = AngleGeometry.hit(ray.origin,ray.direction)
+                let distance = hit?.distance ?? plane.map { simd_distance(ray.origin,$0) } ?? 80
+                line(ray.origin,ray.origin+ray.direction*min(8,distance),alpha:0.25,radius:0.025,
+                     color:.gray,name:"ir-camera-ray-\(side)")
+                // A short arrow at the measured origin makes A -> B explicit.
+                let arrow = node(SCNCone(topRadius:0,bottomRadius:0.13,height:0.6),ray.origin+ray.direction*1.2,alpha:0.9)
+                arrow.simdOrientation = simd_quatf(from:SIMD3<Float>(0,1,0),to:ray.direction)
+                arrow.geometry?.firstMaterial?.diffuse.contents = NSColor.gray;arrow.opacity = 0.25;arrow.name = "ir-camera-forward-\(side)"
+                row = "\(side.capitalized) IR: direction available"
+
             }
             text.append(NSAttributedString(string:row + (side == "left" ? "\n" : ""), attributes:[
                 .font:cameraRayMetrics.font!, .foregroundColor:color
             ]))
         }
-        cameraRayMetrics.attributedStringValue = text
+        if showFull { cameraRayMetrics.attributedStringValue = text }
     }
     func setView() {
         sceneView.pointOfView = camera
@@ -735,6 +813,7 @@ final class AngleDebugger: NSObject, SCNSceneRendererDelegate {
     }
 
     func rebuild(at time: Double = ProcessInfo.processInfo.systemUptime) {
+        metrics.isHidden = rawDirections.state != .on
         updateLabels()
         outlineLock.lock(); outlines.removeAll(); outlineLock.unlock()
         geometry.childNodes.filter { $0 !== referenceGeometry }.forEach { $0.removeFromParentNode() }
@@ -782,26 +861,6 @@ final class AngleDebugger: NSObject, SCNSceneRendererDelegate {
         if referenceKey != referenceGeometryKey {
             referenceGeometryKey = referenceKey
             referenceGeometry.childNodes.forEach { $0.removeFromParentNode() }
-            referenceOrigins.removeAll()
-            var vertices: [SCNVector3] = []
-            for sample in savedReferences where sample.head.count == 6 && sample.target.count == 2 && (sample.head+sample.target).allSatisfy({ $0.isFinite }) {
-                let start = referenceEyeOrigin(sample.head)
-                let end = SIMD3<Float>((Float(sample.target[0])-0.5)*w,(0.5-Float(sample.target[1]))*h,0)
-                referenceOrigins[sample.id] = start
-                vertices.append(SCNVector3(start)); vertices.append(SCNVector3(end))
-            }
-            if !vertices.isEmpty {
-                let indices = vertices.indices.map(UInt32.init)
-                let lines = SCNGeometryElement(indices:indices,primitiveType:.line)
-                let points = SCNGeometryElement(indices:indices,primitiveType:.point)
-                points.pointSize = 3; points.minimumPointScreenSpaceRadius = 1; points.maximumPointScreenSpaceRadius = 2
-                let all = SCNGeometry(sources:[SCNGeometrySource(vertices:vertices)],elements:[lines,points])
-                // Saved evidence stays visible through the translucent scene surfaces.
-                all.materials = [material(0.25),material(0.25)]
-                all.materials.forEach { $0.readsFromDepthBuffer = false; $0.writesToDepthBuffer = false }
-                let batch = SCNNode(geometry:all); batch.name = "saved-reference-rays"; batch.renderingOrder = 20
-                referenceGeometry.addChildNode(batch)
-            }
         }
         drawAccuracyTargets(width:w,height:h)
         let targetUV = targetMode.state == .on ? calibrationTarget() : nil
@@ -820,21 +879,14 @@ final class AngleDebugger: NSObject, SCNSceneRendererDelegate {
         let eyeRadius: CGFloat = 1.2
         let skull = ball(head,1,alpha: 0.12,wire: true); skull.simdScale = [7.7,10,7]; skull.simdOrientation = rotation
         skull.name = "tracked-head"
-        let other = head+rotation.act([-trackingEyeSign*eyeSeparation()/2,2,-5.8]); _ = ball(other,eyeRadius,alpha: 0.19,wire: true)
+        let other = head+rotation.act([-trackingEyeSign*eyeSeparation()/2+value("cx"),2+value("cy"),-5.8+value("cz")]); _ = ball(other,eyeRadius,alpha: 0.19,wire: true)
         let nominal = head+rotation.act([trackingEyeSign*eyeSeparation()/2,2,-5.8])
         let eye = nominal+rotation.act([value("cx"),value("cy"),value("cz")]); lastEye = eye
         let expected = AngleGeometry.unit(target-eye)
-        _ = ball(nominal,0.13,alpha: 0.35)
         _ = ball(eye,eyeRadius,alpha: 0.19,wire: true)
-        _ = ball(eye,0.17)
         let mount = AngleGeometry.rotation(yaw: value("yaw") * .pi/180,pitch: value("pitch") * .pi/180,roll: value("roll") * .pi/180)
         var direction: SIMD3<Float>?
         let liveEye = measurements.sample("eye", at: time) != nil
-        if targetUV != nil, liveHead, state?.onboarding?.sample_accepted == true || state?.onboarding?.cursor_calibration?.sample_accepted == true {
-            // Highlight only the measurement being made now. Accepted samples
-            // remain in the separate, faint history batch.
-            line(eye,target,alpha: 0.9,radius: 0.045,name: "current-target-reference")
-        }
         let liveCenter = measurements.sample("center", at: time) != nil
         let livePupil = measurements.sample("pupil", at: time) != nil
         let eyeVector = displayedSample("eye", at: time)
@@ -861,18 +913,12 @@ final class AngleDebugger: NSObject, SCNSceneRendererDelegate {
             }
         }
         if let direction = direction {
-            let pupil = eye + direction * Float(eyeRadius)
-            _ = ball(pupil,0.35); line(eye,pupil,radius: 0.09)
-            let hit = AngleGeometry.hit(eye,direction)
             // Raw mounting geometry is not the calibrated screen map. Keep the
             // diagnostic ray short instead of sending an apparent gaze beam off screen.
-            line(eye,eye+direction*5,alpha: 0.35, name: "ir-direction")
             alignmentOffset = AngleGeometry.alignment(expected,direction)
-            let error = AngleGeometry.angle(expected,direction)
-            let miss = hit.map { String(format: "Plane miss: %.1f cm%@",simd_distance($0,target), abs($0.x)>w/2 || abs($0.y)>h/2 ? " (off screen)" : "") } ?? "Plane miss: –"
-            if liveHead && liveEye && ((value("px") == 0 && value("py") == 0) || (liveCenter && livePupil)) {
-                freshMetrics[0] = String(format: "Angular difference: %.2f°",error)
-                freshMetrics[1] = miss
+            if liveHead && liveEye {
+                freshMetrics[0] = "Camera mounting: uncalibrated"
+                freshMetrics[1] = "Raw ray: not a screen estimate"
             }
         } else {
             alignmentOffset = nil
@@ -882,6 +928,7 @@ final class AngleDebugger: NSObject, SCNSceneRendererDelegate {
         // must never steer these measurements or force binocular convergence.
         let webcamOrigins = trackingEyeSide == "left" ? [other,eye] : [eye,other]
         for (i, origin) in webcamOrigins.enumerated() {
+            guard rawDirections.state == .on else { continue }
             guard let ray = displayedSample("ray\(i)", at: time),
                   simd_length(SIMD3<Float>(ray.map(Float.init))) > 0.001 else { continue }
             let direction = AngleGeometry.unit(rotation.act(SIMD3<Float>(ray.map(Float.init))))
@@ -894,31 +941,28 @@ final class AngleDebugger: NSObject, SCNSceneRendererDelegate {
                 marker.geometry?.firstMaterial?.diffuse.contents = NSColor.systemCyan
             }
         }
-        let rawGaze = displayedSample("rawGaze", at: time)
-        let freshRay = state?.valid == true && liveHead && (measurements.sample("rawGaze",at: time) != nil || liveEye)
-        let dt = max(0,min(1,time-(lastRayTime ?? time))); lastRayTime = time
-        rayQuality += (Float(freshRay ? 1 : 0)-rayQuality) * Float(1-exp(-dt/0.25))
-        let rayColor = NSColor.systemRed.blended(withFraction: CGFloat(rayQuality), of: .systemGreen) ?? .systemRed
-        let rayEnd: SIMD3<Float>
-        if let uv = rawGaze {
-            if let anchor = anchorDisplay, let primary = NSScreen.screens.first,
-               let endpoint = sceneDesktopPoint([Double(anchor.frame.minX)+uv[0]*Double(anchor.frame.width),
-                    Double(primary.frame.maxY-anchor.frame.maxY)+uv[1]*Double(anchor.frame.height)]) {
-                rayEnd = endpoint
-            } else { rayEnd = [(Float(uv[0])-0.5)*w,(0.5-Float(uv[1]))*h,0] }
-        } else {
-            rayEnd = eye+(direction ?? rotation.act([0,0,-1]))*80
+        // Use the same smoothed, fenced endpoints as the optional desktop rings.
+        // Never use the target or consensus to manufacture either eye's beam.
+        for (side,color) in [("left",NSColor.systemPink),("right",NSColor.systemOrange)] {
+            let displayed = displayedEyes?[side]
+            let point = displayedEyes != nil ? displayed?.0 : state?.eye_predictions?[side]?.desktop
+            let opacity = displayedEyes != nil ? (displayed?.1 ?? 0) : 1.0
+            guard state?.calibrated == true, opacity > 0,
+                  let point = point, let hit = sceneDesktopPoint(point) else { continue }
+            let sign: Float = side == "left" ? -1 : 1
+            let origin = head+rotation.act([sign*eyeSeparation()/2+value("cx"),2+value("cy"),-5.8+value("cz")])
+            line(origin,hit,alpha:CGFloat(opacity)*0.85,radius:0.045,color:color,name:"calibrated-eye-ray-\(side)")
+            let marker = ball(hit,0.22,alpha:CGFloat(opacity))
+            marker.name = "calibrated-eye-hit-\(side)"
+            marker.geometry?.firstMaterial?.diffuse.contents = color
         }
-        let rayDelta = rayEnd-eye
-        let boundedEnd = eye+AngleGeometry.unit(rayDelta)*min(200,simd_length(rayDelta))
-        line(eye,boundedEnd,alpha: 0.9,radius: 0.065,color: rayColor,name: "live-gaze-ray")
-        let rayOrigin = ball(eye,0.23,alpha: 1); rayOrigin.name = "live-gaze-origin"
-        rayOrigin.geometry?.firstMaterial?.diffuse.contents = rayColor
-        if let state = state, state.calibrated, state.display_valid ?? state.valid,
-           let point = state.desktop_gaze, let hit = sceneDesktopPoint(point) {
-            let marker = ball(hit,0.45,alpha: 1); marker.name = "calibrated-screen-gaze"
-            marker.geometry?.firstMaterial?.diffuse.contents = NSColor.systemGreen
-            marker.geometry?.firstMaterial?.emission.contents = NSColor.systemGreen
+        let screenPoint = usesDisplayedCursor ? displayedCursor :
+            (measurements.sample("desktopCursor",at:time) != nil ? state?.desktop_gaze : nil)
+        if let state = state, state.calibrated,
+           let point = screenPoint, let hit = sceneDesktopPoint(point) {
+            let marker = ball(hit,0.45,alpha: cursorOpacity); marker.name = "calibrated-screen-gaze"
+            marker.geometry?.firstMaterial?.diffuse.contents = NSColor.white
+            marker.geometry?.firstMaterial?.emission.contents = NSColor.white
         }
         if !liveHead || (!liveEye && eyeVector != nil) {
             alignmentOffset = nil
