@@ -72,21 +72,43 @@ class BinocularTests(unittest.TestCase):
         for side in ('left','right'):
             np.testing.assert_allclose(pair.predict(side,observation(side,[.25,.6],30)),[.25,.6],atol=1e-8)
 
-    def test_shared_fixation_requires_agreement_not_just_detection_confidence(self):
+    def test_both_mountings_learn_nods_from_the_same_cursor_blocks(self):
+        pair=BinocularCalibration();self.addCleanup(pair.close)
+        target=np.array([.5,.5])
+        for side in ('left','right'):
+            pair.identity(side,(side,0,1))
+            pair.maps[side]=AnchorMap([observation(side,t,0)['eye'] for t in TARGETS])
+        for index,pitch in enumerate((-.18,-.09,0.,.09,.18,-.12,.12)):
+            for j in range(8):
+                stamp=index+j*.07;head=REF.copy();head[1]+=pitch+(j-3.5)*.008
+                views={}
+                for side,gain in (('left',.9),('right',1.2)):
+                    # Different image orientation and counter-rotation gain per eye.
+                    views[side]=observation(side,target+[0,(head[1]-REF[1])*gain],stamp,head)
+                pair.record(views,target,'cursor',stamp,1.6,'left',str(index))
+        for side,gain in (('left',.9),('right',1.2)):
+            self.assertGreater(pair.maps[side].head_model.rank,0)
+            for pitch in (-.06,.06):
+                head=REF.copy();head[1]+=pitch;goal=np.array([.7,.3])
+                obs=observation(side,goal+[0,pitch*gain],20,head)
+                np.testing.assert_allclose(pair.predict(side,obs),goal,atol=.025)
+
+    def test_shared_fixation_keeps_equal_midpoint_when_maps_disagree(self):
         rows={'left':{'uv':[.48,.5],'confidence':.9},'right':{'uv':[.53,.5],'confidence':.5}}
         fused=fuse_predictions(rows,'left')
         self.assertAlmostEqual(fused[0],.505)
         self.assertEqual(shared_fixation(rows)['status'],'binocular')
         np.testing.assert_allclose(fuse_predictions({'right':rows['right']}),[.53,.5])
         rows['right']['uv']=[.8,-1.];rows['right']['confidence']=1.
-        for preferred in ('left','right',None):self.assertIsNone(fuse_predictions(rows,preferred))
+        for preferred in ('left','right',None):
+            np.testing.assert_allclose(fuse_predictions(rows,preferred),[.64,-.25])
         self.assertEqual(shared_fixation(rows)['status'],'disagreement')
         self.assertEqual(rows['right']['uv'],[.8,-1.],'Never overwrite raw evidence with convergence')
         self.assertIsNone(fuse_predictions({}))
 
     def test_disagreement_is_measured_before_fencing_and_pairing_is_bounded(self):
         rows={'left':{'uv':[2.,.5],'confidence':.9},'right':{'uv':[4.,.5],'confidence':.9}}
-        self.assertIsNone(fuse_predictions(rows))
+        np.testing.assert_allclose(fuse_predictions(rows),[3.,.5])
         rows['left'].update(uv=[.5,.5],captured_at=10.)
         rows['right'].update(uv=[.51,.5],captured_at=10.2)
         self.assertEqual(shared_fixation(rows)['status'],'unsynchronized')
@@ -95,7 +117,7 @@ class BinocularTests(unittest.TestCase):
         rows['right']['uv']=[float('nan'),.5]
         self.assertEqual(shared_fixation(rows)['status'],'monocular')
 
-    def test_pipeline_does_not_fall_back_to_primary_during_conflict(self):
+    def test_pipeline_disagreement_uses_midpoint_not_primary(self):
         from hybrid_onboarding import HybridOnboarding
         from unittest.mock import Mock
         flow=object.__new__(HybridOnboarding)
@@ -104,7 +126,7 @@ class BinocularTests(unittest.TestCase):
              'right':{'uv':[.8,.5],'confidence':.95,'desktop':[800,300]}}
         flow.raw_eye_predictions=lambda:raw
         flow.estimate_uv=Mock(return_value=[.2,.5])
-        self.assertIsNone(flow.desktop_point([0]*8))
+        np.testing.assert_allclose(flow.desktop_point([0]*8),[500,300])
         self.assertEqual(flow.eye_predictions(),raw)
         flow.estimate_uv.assert_not_called()
         raw['right']['uv']=[.23,.51]
@@ -113,6 +135,22 @@ class BinocularTests(unittest.TestCase):
         self.assertNotEqual(shown['left']['uv'],shown['right']['uv'])
         self.assertEqual(raw['left']['uv'],[.2,.5])
         self.assertIsNotNone(flow.desktop_point([0]*8))
+
+    def test_display_midpoint_uses_each_eyes_fence_without_mutating_raw_gaze(self):
+        from hybrid_onboarding import HybridOnboarding
+        flow=object.__new__(HybridOnboarding)
+        flow.displays=[{'viewport':[-1000,100,1000,600]}]
+        raw={'left':{'uv':[-2.,.2],'confidence':.9,'captured_at':10.},
+             'right':{'uv':[.8,1.4],'confidence':.5,'captured_at':10.03}}
+        flow.raw_eye_predictions=lambda:raw
+        # Left is fenced at (-992,220), right at (-200,692).
+        np.testing.assert_allclose(flow.desktop_point(None),[-596,456])
+        self.assertEqual(raw['left']['uv'],[-2.,.2])
+        self.assertEqual(raw['right']['uv'],[.8,1.4])
+        raw['right']['captured_at']=10.2
+        self.assertIsNone(flow.desktop_point(None))
+        raw.pop('left')
+        np.testing.assert_allclose(flow.desktop_point(None),[-200,692])
 
     def test_explicit_eye_choice_does_not_change_either_map_or_substitute_missing_eye(self):
         from hybrid_onboarding import HybridOnboarding
@@ -205,4 +243,5 @@ class BinocularTests(unittest.TestCase):
         head=samples[-1][2]
         self.assertGreater(np.linalg.norm(model.project_raw(raw([.8,.2],head),head)-[.5,.5]),.35)
         far=REF+POSE_SCALE*8
-        np.testing.assert_allclose(model.project_raw(raw([.5,.5],far),far),base.project_unbounded(raw([.5,.5],far)))
+        self.assertIsNone(model.project_raw(raw([.5,.5],far),far))
+        self.assertIsNone(model.project_pose_unbounded(raw([.5,.5],far),far,False))

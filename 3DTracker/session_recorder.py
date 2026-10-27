@@ -13,6 +13,8 @@ import threading
 import time
 from urllib.request import urlopen
 from uuid import uuid4
+from gaze_review import analyze
+from binocular_calibration import shared_fixation
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,10 +22,97 @@ RECORDINGS = ROOT / "recordings"
 HELPER = ROOT / ".venv" / "bin" / "eyetracker-screen-recorder"
 PAGE = Path(__file__).with_name("session_recorder.html")
 TRACKER = "http://127.0.0.1:8765/state"
-SAMPLE_INTERVAL = 1 / 24
+SAMPLE_INTERVAL = 1 / 30
 SESSION_ID = re.compile(r"^[0-9]{8}T[0-9]{6}-[0-9a-f]{8}$")
 SAMPLE_HZ = 24
 GROUP_SIZE = 24
+_service = None
+_manager = None
+_service_lock = threading.Lock()
+_helper_lock = threading.Lock()
+
+
+def ensure_helper():
+    source = PAGE.with_name('screen_recorder.swift')
+    with _helper_lock:
+        if not HELPER.exists() or HELPER.stat().st_mtime < source.stat().st_mtime:
+            cache = ROOT/'.venv/swift-cache'
+            cache.mkdir(parents=True,exist_ok=True)
+            subprocess.run(['/usr/bin/swiftc','-parse-as-library','-module-cache-path',str(cache),
+                            str(source),'-o',str(HELPER)],check=True,capture_output=True)
+
+
+def open_service(tracker_port=8765):
+    global _service,_manager,TRACKER
+    with _service_lock:
+        TRACKER = f'http://127.0.0.1:{tracker_port}/state'
+        if _service is None:
+            try:
+                manager = SessionManager()
+                _service = ThreadingHTTPServer(('127.0.0.1',8766),make_handler(manager))
+                _manager = manager
+            except OSError:
+                with urlopen('http://127.0.0.1:8766/api/config',timeout=1) as response:
+                    config=json.load(response)
+                if config.get('service')!='eyecursor-review-v1' or config.get('tracker')!=TRACKER:
+                    raise ValueError('Recording port 8766 is already in use')
+                return
+            threading.Thread(target=_service.serve_forever,name='gaze-review',daemon=True).start()
+
+
+def close_service():
+    global _service,_manager
+    with _service_lock:
+        if _manager and _manager.active: _manager.stop()
+        if _service:
+            _service.shutdown(); _service.server_close()
+        _service = None; _manager = None
+
+
+def research_sample(state, display=None):
+    """Use unbounded measured positions, never fenced/held desktop dots."""
+    flow = state.get('onboarding') or {}
+    learning = (flow.get('phase') in ('waiting','fitting','head','screen','motion','verify','refine')
+                or (flow.get('cursor_calibration') or {}).get('active',False))
+    predictions = state.get('raw_eye_predictions')
+    confidence = state.get('confidence',0)
+    stamp = state.get('gaze_capture_time')
+    capture_id = str(stamp) if stamp is not None else None
+    if state.get('mode') == 'hybrid' and predictions is not None:
+        mode = state.get('gaze_eye_mode','both')
+        detection_eyes = (state.get('eye_cameras') or {}).get('eyes',{})
+        measured = {side:row for side,row in predictions.items()
+                    if not row.get('held') and (mode=='both' or side==mode)
+                    and detection_eyes.get(side,{}).get('measurement_valid',True)}
+        gaze = shared_fixation(measured)['uv']
+        confidence = min((r.get('confidence',0) for r in measured.values()),default=0)
+        capture_id = '|'.join(f"{s}:{r.get('captured_at')}" for s,r in sorted(measured.items())) or None
+        stamp = max((r.get('captured_at',0) for r in measured.values()),default=None)
+    else:
+        gaze = state.get('unclamped_gaze') or state.get('raw_gaze',state.get('gaze')) if state.get('valid') else None
+    viewport = state.get('tracking_viewport')
+    if gaze is not None and display is not None:
+        if viewport is None:
+            gaze = None  # A display-local coordinate cannot be assigned to another monitor.
+        else:
+            x,y,w,h = viewport
+            gaze = [(x+gaze[0]*w-display['x'])/display.get('point_width',display['width']),
+                    (y+gaze[1]*h-display['y'])/display.get('point_height',display['height'])]
+    return dict(valid=gaze is not None,x=gaze[0] if gaze is not None else None,
+                y=gaze[1] if gaze is not None else None,confidence=confidence,
+                capture_id=capture_id,captured_at=stamp,learning=bool(learning),
+                raw_eyes=predictions,detection_eyes=(state.get('eye_cameras') or {}).get('eyes'),
+                displayed_gaze=state.get('desktop_gaze'),
+                binocular_status=state.get('binocular_status'),evidence=state.get('detection_evidence'))
+
+
+def session_data(folder):
+    manifest = json.loads((folder/'session.json').read_text())
+    # Full original observations retain confidence and native capture identity.
+    if (folder/'gaze.jsonl').exists():
+        return dict(manifest=manifest,gaze=load_lines(folder/'gaze.jsonl'),frames=load_lines(folder/'frames.jsonl'))
+    saved = json.loads((folder/'tracking.json').read_text())
+    return expand_tracking(saved,manifest) if saved.get('schema')=='eyetracker.tracking.v2' else saved
 
 
 def read_state():
@@ -32,6 +121,7 @@ def read_state():
 
 
 def displays():
+    ensure_helper()
     completed = subprocess.run([str(HELPER), "--list"], capture_output=True, text=True, timeout=15)
     if completed.returncode:
         raise RuntimeError(completed.stderr.strip() or "Could not list displays")
@@ -120,7 +210,7 @@ class SessionManager:
                 raise ValueError("A session is already recording")
             state = read_state()
             if not state.get("calibrated"):
-                raise ValueError("Complete the four-corner eye calibration first")
+                raise ValueError("Complete eye calibration first")
             selected = next((item for item in displays() if item["id"] == display_id), None)
             if not selected:
                 raise ValueError("Choose a connected display")
@@ -151,11 +241,13 @@ class SessionManager:
                         "started_at_unix_ns": started["epoch_ns"],
                         "tracker_source": state["source"], "status": "recording",
                         "coordinates": "normalized 0..1 from the selected display's top-left",
-                        "time_unit": "milliseconds from first captured screen frame"}
+                        "time_unit": "milliseconds from first captured screen frame",
+                        "gaze_sample_hz":30,"gaze_timing":"state observation time; camera capture identity retained separately",
+                        "gaze_source":"unbounded measured eye maps; held display values excluded"}
             (folder / "session.json").write_text(json.dumps(manifest, indent=2) + "\n")
             active = {"id": session_id, "folder": folder, "process": process,
                       "started_at": manifest["created_at"], "epoch_ns": started["epoch_ns"],
-                      "stop": threading.Event(), "sampler": None}
+                      "display":selected,"stop": threading.Event(), "sampler": None}
             self.active = active
             active["sampler"] = threading.Thread(target=self._sample_gaze, args=(active,), daemon=True)
             active["sampler"].start()
@@ -171,16 +263,14 @@ class SessionManager:
                     error = None
                 except Exception as exc:
                     state, error = {}, str(exc)
-                gaze = state.get("raw_gaze", state.get("gaze")) if state.get("valid") else None
+                gaze = research_sample(state,active.get('display'))
                 output.write(json.dumps({"t_ms": (sampled_ns - active["epoch_ns"]) / 1e6,
-                                         "unix_ns": sampled_ns, "valid": bool(gaze),
+                                         "unix_ns": sampled_ns, **gaze,
                                          "camera_connected": state.get("camera_connected", False),
                                          "calibrated": state.get("calibrated", False),
-                                         "x": gaze[0] if gaze else None,
-                                         "y": gaze[1] if gaze else None,
-                                         "confidence": state.get("confidence", 0),
                                          "error": error}, separators=(",", ":")) + "\n")
                 next_sample += SAMPLE_INTERVAL
+                next_sample = max(next_sample,time.monotonic())
                 active["stop"].wait(max(0, next_sample - time.monotonic()))
 
     def stop(self):
@@ -264,10 +354,12 @@ def make_handler(manager, default_display_id=None):
             try:
                 if self.path == "/":
                     self.file(PAGE, "text/html; charset=utf-8")
+                elif self.path == "/review.js":
+                    self.file(PAGE.with_name('session_review.js'), "text/javascript; charset=utf-8")
                 elif self.path == "/api/displays":
                     self.json(200, displays())
                 elif self.path == "/api/config":
-                    self.json(200, {"default_display_id": default_display_id})
+                    self.json(200, {"default_display_id": default_display_id,"service":"eyecursor-review-v1","tracker":TRACKER})
                 elif self.path == "/api/status":
                     self.json(200, manager.status())
                 elif self.path == "/api/sessions":
@@ -287,18 +379,7 @@ def make_handler(manager, default_display_id=None):
                     elif kind == "tracking":
                         self.file(folder / "tracking.json", "application/json; charset=utf-8")
                     else:
-                        tracking = folder / "tracking.json"
-                        if tracking.exists():
-                            saved = json.loads(tracking.read_text())
-                            if saved.get("schema") == "eyetracker.tracking.v2":
-                                self.json(200, expand_tracking(
-                                    saved, json.loads((folder / "session.json").read_text())))
-                            else:
-                                self.json(200, saved)
-                        else:
-                            self.json(200, {"manifest": json.loads((folder / "session.json").read_text()),
-                                            "gaze": load_lines(folder / "gaze.jsonl"),
-                                            "frames": load_lines(folder / "frames.jsonl")})
+                        self.json(200,session_data(folder))
             except (OSError, RuntimeError, ValueError) as error:
                 self.json(500, {"error": str(error)})
 
@@ -317,6 +398,15 @@ def make_handler(manager, default_display_id=None):
                     self.json(200, manager.start(int(body.get("display_id", 0))))
                 elif self.path == "/api/stop":
                     self.json(200, manager.stop())
+                elif self.path == "/api/review":
+                    session_id = body.get('session_id','')
+                    if not SESSION_ID.fullmatch(session_id): raise ValueError('Choose a saved session')
+                    data = session_data(RECORDINGS/session_id)
+                    display = data['manifest']['display']
+                    start,end = float(body.get('start_ms',0)),float(body['end_ms'])
+                    dispersion = float(body.get('dispersion_px',45))
+                    if not 0<=start<=end or not 5<=dispersion<=500: raise ValueError('Invalid review range or dispersion')
+                    self.json(200,analyze(data['gaze'],display['width'],display['height'],start,end,dispersion))
                 else:
                     self.send_error(404)
             except (ValueError, RuntimeError, OSError, subprocess.TimeoutExpired) as error:
@@ -334,8 +424,7 @@ def main():
     parser.add_argument("--default-display", type=int,
                         help="Preselect this display in the recorder page")
     args = parser.parse_args()
-    if not HELPER.exists():
-        raise SystemExit(f"Compile {HELPER} from 3DTracker/screen_recorder.swift first")
+    ensure_helper()
     RECORDINGS.mkdir(exist_ok=True)
     manager = SessionManager()
     server = ThreadingHTTPServer(("127.0.0.1", args.port),

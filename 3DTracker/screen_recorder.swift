@@ -86,7 +86,8 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, SCRecordingOut
                 for display in content.displays {
                     print(jsonLine(["id": display.displayID, "width": display.width,
                                     "height": display.height, "x": display.frame.minX,
-                                    "y": display.frame.minY]), terminator: "")
+                                    "y": display.frame.minY, "point_width": display.frame.width,
+                                    "point_height": display.frame.height]), terminator: "")
                 }
                 return
             }

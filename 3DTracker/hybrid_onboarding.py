@@ -197,8 +197,8 @@ class HybridOnboarding:
     hybrid=True
     TOTAL_SECONDS=60
     HEAD_SECONDS=30
-    GUIDED_MOTION_SECONDS=24.
-    GUIDED_MOTION_MIN_SECONDS=12.
+    GUIDED_MOTION_SECONDS=36.
+    GUIDED_MOTION_MIN_SECONDS=33.
 
     def __init__(self,calibration,head_camera,clock=time.monotonic,diagnostic_path=None):
         self.calibration=calibration
@@ -299,7 +299,8 @@ class HybridOnboarding:
             binocular_models={side:model_snapshot(m) for side,m in self.binocular.maps.items()},
             thresholds={'head_margin':HEAD_MARGIN.tolist(),'head_scale':HEAD_SCALE.tolist(),
                         'max_pair_gap_seconds':PAIR_MAX_SECONDS,'max_face_age_seconds':FACE_MAX_SECONDS,
-                        'cursor_hold_seconds':1.,'cursor_eye_std_limit':.008,'cursor_fit_error_limit_uv':.1})
+                        'cursor_hold_seconds':1.,'cursor_motion_block_seconds':.5,
+                        'cursor_motion_eye_residual_limit':.006,'cursor_eye_std_limit':.008,'cursor_fit_error_limit_uv':.1})
 
     def log_observation(self,result,target,reason,now):
         if self.audit.path is None:return
@@ -380,7 +381,8 @@ class HybridOnboarding:
         self.last_cursor_decision=None
         if self.phase!='complete':self.phase='cursor'
         self.epoch=self.head_camera.epoch
-        self.audit.append("cursor_started",self.clock(),context_id=self.log_context(),stage=self.cursor_calibration.stage)
+        self.audit.append("cursor_started",self.clock(),context_id=self.log_context(),stage=self.cursor_calibration.stage,
+                          labels_enabled=True,label_source='explicit_stationary_system_cursor')
 
     def start_preview_alignment(self,target):
         if self.phase!='complete' or self.mapping is None:
@@ -396,11 +398,19 @@ class HybridOnboarding:
 
     def geometry_seeds(self):
         seeds=[]
-        for target in TARGETS:
+        for index,target in enumerate(TARGETS):
             rows=[r for r in self.calibration_rays if r['source']=='onboarding' and np.allclose(r['target'],target)]
             if not rows:continue
-            last=rows[-1]['captured_at']
-            rows=[r for r in rows if last-r['captured_at']<1.5]
+            if index==0 and self.center_capture_window:
+                low,high=self.center_capture_window
+                rows=[r for r in rows if low<=r['captured_at']<=high]
+            elif index and self.screen_circle and self.screen_circle.blocks[index-1]:
+                stamps={p[0] for p in self.screen_circle.blocks[index-1]}
+                rows=[r for r in rows if r['captured_at'] in stamps]
+            else:
+                last=rows[-1]['captured_at']
+                rows=[r for r in rows if last-r['captured_at']<1.5]
+            if not rows:continue
             seeds.append((np.median([r['raw_eye'] for r in rows],axis=0),
                           np.median([r['head'] for r in rows],axis=0),np.array(target)))
         # Manual cursor fixations are equally valid screen references. Use the
@@ -438,6 +448,10 @@ class HybridOnboarding:
         session.progress=self.head_refinement.progress(now)
         self.epoch=self.head_camera.epoch
         if guided:
+            self.head_refinement.enable_guided(now)
+            for run in self.binocular.practices.values():
+                if run.paused_elapsed is not None:run.resume(now)
+                run.enable_guided(now)
             self.phase='motion';self.guided_motion_started=now
             self.guided_motion_outcome=None;self.progress=0.;self.sample_accepted=False
             self.target_since=now+.8  # Let the last corner travel to the center.
@@ -448,12 +462,14 @@ class HybridOnboarding:
 
     def guided_motion_deadline(self):
         deadline=self.guided_motion_started+self.GUIDED_MOTION_SECONDS
-        practice=self.head_refinement
-        if practice is not None and practice.phase=='validate':
-            # Do not discard a newly fitted candidate halfway through its fresh
-            # check just because the movement capture timer has expired.
-            deadline=max(deadline,min(deadline+practice.CHECK_SECONDS,
-                                     practice.validation_started+practice.CHECK_SECONDS))
+        # Either eye may finish fitting later. Let its already-started check
+        # finish too; the selected eye must not determine the other eye's budget.
+        base_deadline=deadline
+        for practice in [self.head_refinement,*self.binocular.practices.values()]:
+            if (practice is not None and practice.phase=='validate' and
+                    practice.guided_started==self.guided_motion_started):
+                deadline=max(deadline,min(base_deadline+practice.CHECK_SECONDS,
+                                         practice.validation_started+practice.CHECK_SECONDS))
         return deadline
 
     def update_head_refinement(self,now):
@@ -478,8 +494,13 @@ class HybridOnboarding:
             remaining=max(0.,self.guided_motion_deadline()-now)
             self.progress=min(1.,elapsed/self.GUIDED_MOTION_SECONDS)
             session.remaining_seconds=remaining
-            session.message=('Repeat the same small turns and sideways shifts; keep watching the center.'
-                             if practice.phase=='validate' else 'Small turns and sideways shifts; return to your starting position each time.')
+            cue=practice.motion_cue(now)
+            session.head_cue=cue['key'] if cue else None
+            instructions={'shift':'Slide your head a little left and right; keep your face forward and eyes on the target',
+                          'depth':'Move a little closer, then farther; keep your face level and eyes on the target',
+                          'pitch':'Nod gently up and down; keep your eyes on the target',
+                          'yaw':'Turn your face gently left and right; keep your eyes on the target'}
+            session.message=((('Repeat: ' if cue['checking'] else '')+instructions[cue['key']]) if cue else practice.message)
             self.message=session.message
             rig=self.calibration.eye_cameras
             active=rig.context()[0] if rig else 'right'
@@ -493,7 +514,19 @@ class HybridOnboarding:
                 session.active=False;practice.pause(now);self.binocular.finish_head(now)
                 self.phase='complete'
                 self.audit.append('guided_head_finished',now,outcome=self.guided_motion_outcome,eyes=learned,report=practice.state(now))
-                self.start_accuracy_check()
+                self.finish_guided_calibration()
+
+    def finish_guided_calibration(self):
+        """Finish the two learning stages; an accuracy exam is optional."""
+        self.phase='complete';self.progress=1.;self.sample_accepted=False
+        self.calibration.desktop_cursor=True;self.blocker=''
+        self.message='Calibration finished. Refine by looking at the system cursor when needed.'
+        if self.guided_motion_outcome=='previous_fit_kept':
+            self.message='Five-dot map ready. No head correction learned; refine with the system cursor at different head positions.'
+        elif self.guided_motion_outcome=='partial':
+            self.message='Five-dot maps ready. Head correction learned for one eye; refine with the system cursor.'
+        self.audit.append('guided_calibration_finished',self.clock(),outcome=self.guided_motion_outcome,
+                          accuracy_checked=False)
 
     def refine_head(self,observation,stamp,now):
         # A rejected primary pupil must not stop the companion from learning
@@ -506,6 +539,8 @@ class HybridOnboarding:
                 self.binocular.record(companion,[.5,.5],'geometry-training',now,
                     self.displays[0]['viewport'][2]/self.displays[0]['viewport'][3],rig.context()[0])
                 for side,run in self.binocular.practices.items():
+                    if self.phase=='motion' and run.guided_started is None:
+                        run.enable_guided(self.guided_motion_started)
                     if run.accepted and run.last_capture:
                         kind,sample=run.last_capture
                         self.audit.append('head_motion_eye_sample',now,eye=side,source=kind,sample=sample)
@@ -577,13 +612,27 @@ class HybridOnboarding:
         before=session.saved_count
         predicted=self.estimate_uv(self.feature(result)) if result else None
         session.observe(target,eye,stamp,now,pose=observation[1] if observation is not None else None,
-                        evidence={'raw_eye':observation[0].tolist(),'predicted':predicted} if observation else None)
+                        evidence={'raw_eye':observation[0].tolist(),'predicted':predicted,
+                                  'per_eye_predictions':self.raw_eye_predictions()} if observation else None)
         if session.saved_count>before:
             fixation_id=uuid.uuid4().hex
             for _,saved_eye,saved_head,saved_target,evidence in session.last_capture:
                 if saved_head is not None:
                     self.record_reference(saved_eye,saved_head,saved_target,'preview' if session.fixed_target else 'cursor',
                                           evidence['predicted'],evidence['captured_at'],evidence['raw_eye'],fixation_id)
+            capture=session.last_capture
+            poses=np.array([row[2] for row in capture if row[2] is not None])
+            head_model=getattr(session.candidate,'head_model',None)
+            self.audit.append('cursor_learning_update',now,context_id=self.log_context(),
+                target_uv=target,capture_kind=getattr(session,'capture_kind','fixation'),
+                head_change_degrees=np.degrees(poses[-1,:3]-poses[0,:3]) if len(poses) else None,
+                head_translation_feature_change=poses[-1,3:]-poses[0,3:] if len(poses) else None,
+                head_correction_status=getattr(head_model,'status',None),
+                head_correction_rank=getattr(head_model,'rank',0),
+                samples=[{'captured_at':row[4]['captured_at'],'raw_eye':row[4]['raw_eye'],
+                          'head':row[2],'predicted_before':row[4]['predicted'],
+                          'eyes_before':row[4].get('per_eye_predictions',{})} for row in capture],
+                note='Explicit cursor target is the label. Before-update errors are training feedback, not an independent accuracy check.')
         if session.fixed_target is not None and session.accepted:
             session.message=('Reference saved. Keep watching the marker; gently move your head and pause.'
                              if session.progress>=1 else 'Keep watching the fixed marker; hold this head position for one second.')
@@ -619,7 +668,7 @@ class HybridOnboarding:
         elif self.cursor_backup:
             self.phase,self.mapping,self.head_fit=self.cursor_backup
             session.message+=' · Previous calibration retained'
-        self.audit.append('cursor_finished',self.clock(),context_id=self.log_context(),applied=session.candidate is not None,message=session.message)
+        self.audit.append('cursor_finished',self.clock(),context_id=self.log_context(),applied=session.candidate is not None,message=session.message,labels_enabled=False)
         self.cursor_backup=None
 
     def cancel(self):
@@ -823,7 +872,7 @@ class HybridOnboarding:
                     # A usable five-dot map must survive missing head-fit seeds.
                     self.guided_motion_outcome='previous_fit_kept'
                     self.audit.append('guided_head_unavailable',now,reason=str(error))
-                    self.start_accuracy_check()
+                    self.finish_guided_calibration()
             except ValueError as error:
                 self.screen_circle.fit_status=str(error)
                 self.phase='paused';self.stopped_stage='screen';self.message=str(error)
@@ -1115,6 +1164,7 @@ class HybridOnboarding:
             predictions[side]={'uv':np.asarray(uv).tolist(),'confidence':observation['confidence'],
                 'head_features':observation['head'],'captured_at':observation['time'],
                 'identity':str(observation['identity']),
+                'held':bool(observation.get('held',False)),
                 'desktop':fence(uv,self.displays[0]['viewport'])}
         return predictions
 
@@ -1132,13 +1182,17 @@ class HybridOnboarding:
 
     def desktop_point(self,feature):
         raw,fixation=self.binocular_estimate()
-        if fixation['status'] in ('disagreement','unsynchronized'):return None
+        if fixation['status']=='unsynchronized':return None
         uv=fixation['uv']
         if uv is None and getattr(getattr(self,'calibration',None),'gaze_eye_mode','both')!='both':return None
         if uv is None:uv=self.estimate_uv(feature)
         if not self.displays or uv is None:return None
-        x,y,w,h=self.displays[0]['viewport']
-        return fence(uv,self.displays[0]['viewport'])
+        viewport=self.displays[0]['viewport']
+        if len(fixation['sides'])==2:
+            # Average the displayed eye positions, including their screen fence,
+            # so the white cursor stays between the two colored markers.
+            return np.mean([fence(raw[side]['uv'],viewport) for side in fixation['sides']],axis=0).tolist()
+        return fence(uv,viewport)
 
     def state(self,now=None):
         now=self.clock() if now is None else now

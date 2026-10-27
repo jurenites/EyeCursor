@@ -17,6 +17,7 @@ class EyeCameraRig:
         self.path = Path(path)
         self.opener = opener or IsolatedCapture
         self.excluded_id = excluded_id
+        self.excluded_ids = {excluded_id} - {None}
         self.clock = clock
         self.lock = threading.RLock()
         self.stop = threading.Event()
@@ -27,6 +28,7 @@ class EyeCameraRig:
                        'right': {'device_id': None, 'rotation': 0}}
         self.samples = {}
         self.tracking = {}
+        self.sphere_fixed = {}
         self.observation_history = {eye: deque(maxlen=600) for eye in ("left","right")}
         self.tracking_errors = {}
         self.revisions = {'left': 0, 'right': 0}
@@ -59,10 +61,12 @@ class EyeCameraRig:
             if not isinstance(item, dict) or 'device_id' not in item or type(item.get('rotation')) is not int or item['rotation'] not in (0, 180):
                 raise ValueError('Eye rotation must be 0 or 180 degrees')
             device = item.get('device_id')
+            if 'fixed_eye_sphere' in item and type(item['fixed_eye_sphere']) is not bool:
+                raise ValueError('Fixed eye sphere must be a boolean')
             if device is not None and (not isinstance(device, str) or not device or len(device) > 256):
                 raise ValueError('Invalid camera ID')
             if device:
-                if device == self.excluded_id:
+                if device == self.excluded_id or device in self.excluded_ids:
                     raise ValueError('The head webcam cannot also be an eye camera')
                 ids.append(device)
         if len(ids) != len(set(ids)):
@@ -91,12 +95,16 @@ class EyeCameraRig:
             if any(config[e]['device_id'] and config[e]['device_id'] not in known | saved for e in ('left', 'right')):
                 raise ValueError('Choose an available USB camera')
             new = json.loads(json.dumps(config))
+            for eye in ('left', 'right'):
+                if 'fixed_eye_sphere' not in new[eye] and 'fixed_eye_sphere' in self.config[eye]:
+                    new[eye]['fixed_eye_sphere'] = self.config[eye]['fixed_eye_sphere']
             self.path.parent.mkdir(parents=True, exist_ok=True)
             temporary = self.path.with_suffix('.tmp')
             temporary.write_text(json.dumps(new, indent=2) + '\n')
             temporary.replace(self.path)
             for eye in ('left', 'right'):
-                if new[eye] != self.config[eye]:
+                if any(new[eye][key] != self.config[eye][key] for key in ('device_id', 'rotation')):
+                    self.sphere_fixed.pop(eye, None)
                     self.samples.pop(eye, None)
                     self.tracking.pop(eye, None)
                     self.tracking_errors.pop(eye, None)
@@ -104,6 +112,22 @@ class EyeCameraRig:
                     self.tracking_times[eye].clear()
                     self.times[eye].clear()
             self.config = new
+
+    def set_fixed_eye_sphere(self, eye, fixed):
+        if eye not in ('left', 'right') or type(fixed) is not bool:
+            raise ValueError('Choose an eye and a boolean fixed eye sphere value')
+        with self.lock:
+            config = json.loads(json.dumps(self.config))
+            config[eye]['fixed_eye_sphere'] = fixed
+            self.configure(config)
+
+    def apply_eye_sphere_setting(self, eye, detector, model):
+        with self.lock:
+            # Existing setups retain automatic readiness-based freezing until
+            # the user explicitly chooses fixed or automatic adjustment.
+            fixed = self.config[eye].get('fixed_eye_sphere', model.phase != 'collecting')
+            detector.eye_sphere_adjustment_enabled = not fixed
+            self.sphere_fixed[eye] = fixed
 
     def start(self):
         for target, args in ((self._discover, ()), (self._capture, ('left',)), (self._capture, ('right',))):
@@ -116,7 +140,7 @@ class EyeCameraRig:
             try:
                 devices = [d for d in self.enumerate_devices()
                            if 'usb' in d['name'].lower() and 'camera' in d['name'].lower()
-                           and d['id'] != self.excluded_id]
+                           and d['id'] != self.excluded_id and d['id'] not in self.excluded_ids]
                 with self.lock:
                     self.devices = devices
                     self.discovery_error = None
@@ -331,7 +355,10 @@ class EyeCameraRig:
                         and finite(head, 6)):
                     direction = {'vector': vector, 'head_features': head, 'captured_at':tracked['time']}
                 eyes[eye] = {**self.config[eye], 'connected': connected, 'fps': fps,
+                             'fixed_eye_sphere': self.config[eye].get('fixed_eye_sphere', self.sphere_fixed.get(eye, False)),
                              'tracking_fps': tracking_fps,
+                             'measurement_valid': bool(tracking_fresh and tracked['valid']),
+                             'captured_at': tracked['time'] if tracking_fresh else None,
                              'tracking': ('Pupil tracked' if tracked['valid'] else 'Searching for pupil') if tracking_fresh else 'Waiting for detection',
                              'confidence': result.get('confidence'),
                              'pupil_center': (result.get('pupil_ellipse') or {}).get('center'),

@@ -54,6 +54,22 @@ class GeometricTests(unittest.TestCase):
         run.tick(10)
         self.assertEqual(run.candidate.eye_side,'left')
 
+    def test_wide_webcam_geometry_is_learned_instead_of_forced_to_45_degrees(self):
+        def measured(target,head):
+            origin=eye_origin(head,DEPTH,BASE[5],ASPECT,vertical_fov_degrees=75.)
+            local=head_rotation(head).T@(screen_point(target,ASPECT)-origin)
+            return np.array([.48,.43])+np.linalg.solve(MATRIX,local[:2]/-local[2]-OFFSET)
+        seeds=[(measured(t,BASE),BASE.copy(),t) for t in TARGETS]
+        base=AnchorMap([s[0] for s in seeds]);fit=HeadCompensation()
+        fit.fit_steady([seeds[0][0]]*10,[BASE]*10)
+        samples=[(t,measured([.5,.5],moving_head(t)),moving_head(t),np.array([.5,.5])) for t in np.arange(0,10,.1)]
+        model=GeometricGazeMap.fit(base,fit,seeds,samples,ASPECT)
+        self.assertEqual(model.vertical_fov_degrees,75.)
+        self.assertTrue(model.geometry()['assumed_optics'],'Effective FOV is not measured camera calibration')
+        for t in [1.3,3.4,6.7]:
+            for target in ([.2,.7],[.8,.3]):
+                np.testing.assert_allclose(model.project_raw(measured(target,moving_head(t)),moving_head(t)),target,atol=.025)
+
     def test_combined_rotation_translation_and_eye_counterrotation_recover_unseen_targets(self):
         base,fit,seeds=fixture()
         samples=[(t,physical_eye([.5,.5],moving_head(t)),moving_head(t),np.array([.5,.5])) for t in np.arange(0,10,.1)]

@@ -35,6 +35,10 @@ These instructions apply to every chat working in this project.
 - Preserve `fitMenuStatusToActions()` and its call after menu title updates in
   `3DTracker/native_calibration.swift`. Check every visible menu item, including
   disabled items and new actions, since any one title can expand an `NSMenu`.
+- Truncate dynamic text before assigning `NSMenuItem.title`; never briefly assign
+  the full message and shorten it afterward. AppKit can retain that intermediate
+  width while the menu is open. Regression checks must observe title mutations
+  and actual native menu width, not just the final displayed string.
 - Before delivering a menu change, run the existing native lifecycle checks and
   cover any new source of long text in their width assertions. Inspect the opened
   menu with normal and long/error text when runtime verification is available.

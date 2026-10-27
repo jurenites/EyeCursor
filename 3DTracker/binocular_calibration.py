@@ -1,7 +1,7 @@
 """Independent screen maps from simultaneous, explicitly labelled eye samples."""
 import numpy as np
 from quick_calibration import AnchorMap,TARGETS
-from cursor_calibration import CursorMap,PoseAnchorMap
+from cursor_calibration import CursorMap,PoseAnchorMap,motion_block_is_coherent
 from continuous_calibration import ContinuousTargetCalibration
 from gaze_mapping import project_unbounded
 from dot_learning import TargetCapture
@@ -50,11 +50,13 @@ class BinocularCalibration:
             if source in ('cursor','preview') and fixation_id and side in self.maps:
                 hold=self.manual_hold.get(side)
                 if hold is None or hold[0]!=fixation_id:hold=(fixation_id,[]);self.manual_hold[side]=hold
-                hold[1].append((eye,head,target))
-                if len(hold[1])>=3:
+                if hold[1] and obs['time']<=hold[1][-1][3]:continue
+                hold[1].append((eye,head,target,obs['time']))
+                if len(hold[1])>=6:
                     anchor=tuple(np.median([r[k] for r in hold[1]],axis=0) for k in range(3))
                     # Primary-eye acceptance does not prove companion stability.
-                    if np.max(np.std([r[0] for r in hold[1]],axis=0))>.008:continue
+                    if np.max(np.std([r[0] for r in hold[1]],axis=0))>.008 and not motion_block_is_coherent(
+                            [r[3] for r in hold[1]],[r[0] for r in hold[1]],[r[1] for r in hold[1]],PoseAnchorMap.pose_scale):continue
                     points=dict(self.manual_points[side]);points[fixation_id]=anchor
                     points=dict(list(points.items())[-80:])
                     try:
@@ -161,8 +163,8 @@ class BinocularCalibration:
 def shared_fixation(predictions,aspect=1.):
     """A single screen fixation, with disagreement treated as model uncertainty.
 
-    Agreement is necessary, not proof of accuracy. Agreeing calibrated positions
-    have equal weight; detector confidence cannot choose the more accurate map.
+    Finite, synchronized calibrated positions have equal weight even when their
+    maps disagree; detector confidence cannot choose the more accurate map.
     Raw per-eye estimates stay unchanged for calibration and audit.
     """
     valid={}
@@ -179,14 +181,13 @@ def shared_fixation(predictions,aspect=1.):
     if all(t is not None for t in times) and max(times)-min(times)>.12:
         return {'status':'unsynchronized','uv':None,'sides':[],'disagreement':None}
     distance=float(np.linalg.norm((np.asarray(rows[0]['uv'])-rows[1]['uv'])*[1.,1./aspect]))
-    # Eight percent of screen width. Apply before desktop fencing: two absurd
-    # off-screen estimates must not become agreement just by hitting the same edge.
-    if distance>.08:
-        return {'status':'disagreement','uv':None,'sides':[],'disagreement':distance}
+    # Keep disagreement before fencing as a diagnostic, not a visibility veto.
+    # The midpoint is a display estimate, not proof that either map is accurate.
     # Pupil-detection confidence is not screen-mapping accuracy. Neither eye
     # earns more influence merely because its pupil outline is easier to detect.
     point=np.mean([r['uv'] for r in rows],axis=0)
-    return {'status':'binocular','uv':point.tolist(),'sides':list(valid),'disagreement':distance}
+    return {'status':'disagreement' if distance>.08 else 'binocular',
+            'uv':point.tolist(),'sides':list(valid),'disagreement':distance}
 
 
 def fuse_predictions(predictions,preferred=None,aspect=1.):

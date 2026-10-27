@@ -122,6 +122,24 @@ class ScreenGazePipelineTests(unittest.TestCase):
         self.assertFalse(state['gaze_smoothing']['holding_jump'])
         self.assertEqual(state['desktop_gaze'], [960, 540])
 
+    def test_live_eye_midpoint_survives_expired_combined_jump_filter(self):
+        from types import SimpleNamespace
+        eyes={side:{'uv':uv,'desktop':point,'captured_at':self.now,'confidence':.9}
+              for side,uv,point in [('left',[.2,.2],[384,216]),('right',[.8,.6],[1536,648])]}
+        self.c.onboarding=SimpleNamespace(
+            hybrid=True,phase='complete',message='Ready',has_screen_mapping=True,
+            tick=lambda:None,observation=lambda _: (1,2,3),feature=lambda _: [0]*8,
+            eye_predictions=lambda:eyes,desktop_point=lambda _: [960,432],
+            displays=[{'viewport':[0,0,1920,1080]}],estimate_uv=lambda _: [.5,.4],
+            binocular_estimate=lambda:(eyes,{'status':'disagreement','disagreement':.6}),
+            state=lambda:{'phase':'complete'})
+        # Eye estimates are live, but an independent jump filter has expired.
+        with patch.object(self.c,'update_screen_motion'), patch.object(self.c.screen_motion,'sample',return_value=None):
+            state=self.c.state()
+        self.assertEqual(state['desktop_gaze'],[960,432])
+        self.assertTrue(state['display_valid'])
+        self.assertFalse(state['gaze_smoothing']['holding_jump'])
+
     def test_spike_or_lag_cannot_publish_a_click_at_raw_destination(self):
         self.c.blink_click_enabled = True
         self.feed(.95, .05)

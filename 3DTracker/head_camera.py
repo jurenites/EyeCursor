@@ -13,6 +13,7 @@ import time
 import cv2
 import numpy as np
 from live_capture import ReconnectingCapture
+from isolated_capture import IsolatedCapture
 
 MODEL_PATH = Path(__file__).resolve().parents[1] / '.venv/models/face_landmarker.task'
 PAIR_MAX_SECONDS = .12
@@ -120,11 +121,12 @@ class FacePreviewCrop:
 
 
 class HeadCamera:
-    def __init__(self, enumerate_cameras, requested_id=None, model_path=MODEL_PATH):
+    def __init__(self, enumerate_cameras, requested_id=None, model_path=MODEL_PATH, isolated=False):
         self.enumerate_cameras = enumerate_cameras
         self.device_id = requested_id
         self.name = 'Laptop webcam'
         self.model_path = Path(model_path)
+        self.isolated = isolated
         self.lock = threading.Lock()
         self.history = deque(maxlen=60)
         self.stamps = deque(maxlen=60)
@@ -148,12 +150,16 @@ class HeadCamera:
         try:
             selected = choose_head_camera(self.enumerate_cameras(), self.device_id)
             self.device_id, self.name = selected['id'], selected['name']
-            cap = cv2.VideoCapture(selected['index'], cv2.CAP_AVFOUNDATION)
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-            self.epoch += 1
+            if self.isolated:
+                cap = IsolatedCapture(selected['index'])
+            else:
+                cap = cv2.VideoCapture(selected['index'], cv2.CAP_AVFOUNDATION)
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
             with self.lock:
+                self.epoch += 1
                 self.history.clear()
+                self.stamps.clear()
             return cap
         except (ValueError, SystemExit) as error:
             self.error = str(error)
@@ -170,15 +176,16 @@ class HeadCamera:
                 min_face_detection_confidence=.6, min_face_presence_confidence=.6,
                 min_tracking_confidence=.6, output_facial_transformation_matrixes=True)
             with mp.tasks.vision.FaceLandmarker.create_from_options(options) as detector:
-                cap = ReconnectingCapture(self._open)
+                cap = ReconnectingCapture(self._open, warmup_seconds=8.)
                 last_ms = -1
                 preview_crop = FacePreviewCrop()
                 while not self.stop_event.is_set():
                     ok, image = cap.read()
-                    stamp = time.monotonic()
+                    stamp = cap.frame_time if ok else time.monotonic()
                     if not ok:
                         with self.lock:
-                            self.history.clear()
+                            if self.history and stamp-self.history[-1]['time'] > FACE_MAX_SECONDS:
+                                self.history.clear()
                         self.stop_event.wait(.03)
                         continue
                     # Preserve aspect ratio; cap inference input width for predictable latency.

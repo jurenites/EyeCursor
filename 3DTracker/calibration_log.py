@@ -9,7 +9,7 @@ import numpy as np
 MODEL_FIELDS=('reference','coefficients','bounds','error','mode','eyes','offset','shift',
               'anchors','eye_scale','residuals','pose_scale','rank','support','status',
               'pair_count','fit_error','depth','reference_width','aspect','camera_aspect',
-              'head_coefficients','eye_center','validation_error','degree','ridge','fit_metrics')
+              'quadratic_interactions','head_coefficients','eye_center','vertical_fov_degrees','validation_error','degree','ridge','fit_metrics')
 
 
 def numeric(value):
@@ -78,6 +78,11 @@ def summarize(path):
               for r in rows if r['event'] in ('cursor_finished','cursor_fixation_result','screen_fit_result')]
     return {'session_id':rows[0]['session_id'] if rows else None,'events':dict(events),
             'sampled_observation_decisions':dict(decisions),'recent_outcomes':outcomes[-12:],
+            'head_checks':[{'event':r['event'],'utc':r.get('utc'),
+                           'diagnostics':r.get('report',{}).get('validation_diagnostics',{}),
+                           'error_uv':r.get('report',{}).get('validation_error_uv')}
+                          for r in rows if r['event'] in ('head_motion_fit_rejected','head_motion_fit_applied')][-8:],
+            'cursor_learning_updates':sum(r['event']=='cursor_learning_update' for r in rows),
             'note':'Counts describe logged evidence; they are not a physical accuracy score.'}
 
 

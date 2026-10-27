@@ -5,6 +5,7 @@ FOV, principal point and eye separation remain explicit assumptions. Calibration
 fits pupil-to-head-local ray tangents and a bounded depth scale; it does not claim
 an anatomical eyeball reconstruction. Validation is a later, untouched capture.
 """
+from itertools import product
 import numpy as np
 from gaze_mapping import project_unbounded
 
@@ -21,10 +22,10 @@ def head_rotation(head):
     return c@rz@ry@rx@c.T
 
 
-def eye_origin(head,depth,reference_width,aspect,camera_aspect=16/9,eye_side="right"):
+def eye_origin(head,depth,reference_width,aspect,camera_aspect=16/9,eye_side="right",vertical_fov_degrees=45.):
     # Same unmirrored camera/screen convention as AngleGeometry in the native UI.
     d=depth*np.exp(np.clip(reference_width-head[5],-.7,.7))
-    fy=.5/np.tan(np.pi/8);fx=fy/camera_aspect
+    fy=.5/np.tan(np.deg2rad(vertical_fov_degrees)/2);fx=fy/camera_aspect
     middle=np.array([-(head[3]-.5)*d/fx,
                      .5/aspect+.7/30.2+(.5-head[4])*d/fy,d])
     return middle+head_rotation(head)@np.array([(-1 if eye_side == "left" else 1)*3.2/30.2,0,0])
@@ -95,8 +96,11 @@ class GeometricGazeMap:
         rotations=np.array([head_rotation(h) for h in poses])
         model.reference_width=float(np.median(poses[:len(seeds),5]))
         best=None;max_retained=0.;best_motion_error=float("inf")
-        for depth in np.linspace(.65,3.3,38):
-            origins=np.array([eye_origin(h,depth,model.reference_width,aspect,camera_aspect,eye_side) for h in poses])
+        # The installed webcam's lens is not calibrated. Fit a bounded effective
+        # FOV jointly with depth instead of forcing every camera to 45 degrees.
+        # This remains estimated geometry and must pass untouched later samples.
+        for fov,depth in product((45.,30.,60.,75.),np.linspace(.65,3.3,38)):
+            origins=np.array([eye_origin(h,depth,model.reference_width,aspect,camera_aspect,eye_side,fov) for h in poses])
             world=np.array([screen_point(t,aspect) for t in targets])-origins
             local=np.einsum('nji,nj->ni',rotations,world)
             if np.any(local[:,2]>=-.1):continue
@@ -125,11 +129,11 @@ class GeometricGazeMap:
             best_motion_error=min(best_motion_error,float(np.percentile(errors[len(seeds):],80)))
             if robust and (np.sum(kept)<10 or np.mean(kept)<.7):continue
             score=float(np.mean(errors[:len(seeds)]**2)+np.mean(errors[len(seeds):][kept]**2))
-            if best is None or score<best[0]:best=(score,float(depth),coefficient.copy(),errors,kept)
+            if best is None or score<best[0]:best=(score,float(depth),coefficient.copy(),errors,kept,float(fov))
         if best is None:raise ValueError(f'Geometric model retained at most {max_retained:.0%} of motion blocks; needs 70%. Best movement error {best_motion_error:.3f} UV')
-        _,model.depth,model.coefficients,errors,kept=best
+        _,model.depth,model.coefficients,errors,kept,model.vertical_fov_degrees=best
         selected=np.r_[np.ones(len(seeds),dtype=bool),kept]
-        model.fit_metrics={"motion_blocks":len(blocks),"retained_blocks":int(np.sum(kept)),"rejected_blocks":int(np.sum(~kept))}
+        model.fit_metrics={"motion_blocks":len(blocks),"retained_blocks":int(np.sum(kept)),"rejected_blocks":int(np.sum(~kept)),"effective_vertical_fov_degrees":model.vertical_fov_degrees,"estimated_optics":True}
         if np.max(errors[:len(seeds)])>.08 or np.percentile(errors[len(seeds):][kept],80)>.08:
             raise ValueError('Eye rays and known targets disagree; the previous map is kept')
         model.error=float(np.percentile(errors[selected],80))
@@ -143,13 +147,20 @@ class GeometricGazeMap:
         q=np.r_[1.,(raw-self.eye_center)/self.eye_scale]@self.coefficients
         direction=head_rotation(pose)@np.r_[q,-1.]
         direction/=np.linalg.norm(direction)
-        origin=eye_origin(pose,self.depth,self.reference_width,self.aspect,self.camera_aspect,self.eye_side)
+        origin=eye_origin(pose,self.depth,self.reference_width,self.aspect,self.camera_aspect,self.eye_side,getattr(self,"vertical_fov_degrees",45.))
         if direction[2]>=-.05:return None
         point=origin-direction*origin[2]/direction[2]
         uv=np.array([point[0]+.5,.5-point[1]*self.aspect])
         return origin,direction,uv
 
     def project_raw(self,raw,pose):
+        pose=np.asarray(pose)
+        if pose.shape!=(6,) or not np.isfinite(pose).all():return None
+        if np.any(pose<self.bounds[0]-.5*POSE_SCALE) or np.any(pose>self.bounds[1]+.5*POSE_SCALE):return None
+        return self.evaluate_raw(raw,pose)
+
+    def evaluate_raw(self,raw,pose):
+        """Held-out evaluation does not inherit the training coverage gate."""
         ray=self.ray(raw,pose)
         return ray[2] if ray is not None else None
 
@@ -171,7 +182,7 @@ class GeometricGazeMap:
     def geometry(self):
         return {'eye_side':self.eye_side,'depth_screen_widths':self.depth,'reference_log_face_width':self.reference_width,
                 'camera_aspect':self.camera_aspect,'screen_aspect':self.aspect,
-                'vertical_fov_degrees':45.,'eye_separation_screen_widths':6.4/30.2,
+                'vertical_fov_degrees':getattr(self,'vertical_fov_degrees',45.),'eye_separation_screen_widths':6.4/30.2,
                 'assumed_optics':True,'validation_error_uv':self.validation_error,
                 'checked_motion':getattr(self,'checked_motion',{'rotation':False,'translation':False})}
 

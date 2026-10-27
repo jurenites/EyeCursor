@@ -64,6 +64,53 @@ class ContinuousTests(unittest.TestCase):
         self.assertFalse(run.done)
         self.assertGreater(run.rejected,500)
 
+    def test_failed_check_samples_train_only_the_next_candidate(self):
+        run=self.make_run();self.feed(run,.1,9.2)
+        frozen=run.candidate.coefficients.copy()
+        training={s[0] for s in run.training_snapshot}
+        self.feed(run,9.2,10.5,away=True)
+        check_times={s[0] for s in run.validation}
+        self.assertTrue(check_times)
+        self.assertFalse(check_times & training)
+        np.testing.assert_array_equal(run.candidate.coefficients,frozen)
+        self.feed(run,10.5,13.5,away=True)
+        self.assertFalse(run.applied)
+        self.assertTrue(check_times.issubset({s[0] for s in run.samples}))
+
+    def test_guided_cues_share_shift_depth_nod_turn_clock_across_eyes(self):
+        run=self.make_run();run.enable_guided(100)
+        self.assertEqual([run.motion_cue(t)['key'] for t in (100,104,108,112)],['shift','depth','pitch','yaw'])
+        other=self.make_run();other.enable_guided(100)
+        run.phase='validate';run.validation_started=117.3
+        other.phase='validate';other.validation_started=119.1
+        for t in np.arange(117,134,.1):
+            self.assertEqual(run.motion_cue(t)['key'],other.motion_cue(t)['key'])
+        self.assertEqual(run.motion_cue(120)['key'],'depth')
+        self.assertTrue(run.motion_cue(120)['checking'])
+
+    def test_guided_check_does_not_claim_turn_compensation_without_turns(self):
+        run=self.make_run();run.enable_guided(100)
+        for t in np.arange(.1,34,.1):
+            head=moving_head(t);head[0]=0.
+            run.observe((physical_eye([.5,.5],head),head),100+t,100+t)
+        self.assertFalse(run.applied)
+        self.assertIn('per_motion',run.validation_diagnostics)
+        turn=run.validation_diagnostics['per_motion']['yaw']
+        self.assertFalse(turn['movement_observed'])
+        self.assertFalse(turn['accepted'])
+        self.assertGreater(len(run.samples),len(run.training_snapshot), 'Failed check evidence is retained')
+
+    def test_sideways_motion_cannot_count_as_checked_depth(self):
+        run=self.make_run();run.enable_guided(100)
+        for t in np.arange(.1,34,.1):
+            head=moving_head(t);head[5]=run.head_fit.reference[5]
+            run.observe((physical_eye([.5,.5],head),head),100+t,100+t)
+        self.assertFalse(run.applied)
+        depth=run.validation_diagnostics['per_motion']['depth']
+        self.assertFalse(depth['movement_observed'])
+        self.assertFalse(depth['accepted'])
+        self.assertEqual(depth['head_feature_span'][5],0.)
+
     def test_fit_failure_is_reported_and_finish_does_not_claim_success(self):
         run=self.make_run();original=run.base_mapping
         with patch('continuous_calibration.fit_head_candidate',side_effect=ValueError('Head/eye measurements do not fit the geometric model')):
@@ -89,6 +136,23 @@ class ContinuousTests(unittest.TestCase):
         for t in (1.,3.,6.,9.):
             for target in ([.5,.5],[.2,.8],[.8,.2]):
                 np.testing.assert_allclose(model.project_raw(physical_eye(target,moving_head(t)),moving_head(t)),target,atol=.035)
+
+    def test_check_evaluates_new_poses_before_extending_live_support(self):
+        run=self.make_run()
+        self.feed(run,.1,9.2)
+        self.assertEqual(run.phase,'validate')
+        candidate=run.candidate
+        # Narrow the live support while preserving the independently fitted ray.
+        center=candidate.reference.copy()
+        candidate.bounds=np.array([center-.001,center+.001])
+        t=9.5;head=moving_head(t);eye=physical_eye([.5,.5],head)
+        self.assertIsNone(candidate.project_raw(eye,head))
+        np.testing.assert_allclose(candidate.evaluate_raw(eye,head),[.5,.5],atol=.035)
+        self.feed(run,9.2,13.5)
+        self.assertTrue(run.applied,run.state(113.5))
+        self.assertGreater(run.validation_diagnostics['outside_training_support'],0)
+        self.assertEqual(run.validation_diagnostics['missing_predictions'],0)
+        self.assertIsNotNone(run.result.project_raw(eye,head))
 
     def test_shape_gate_only_rejects_gross_disagreement_with_a_supported_iris(self):
         row={'pupil_ellipse':{'axes':[30,80],'angle_degrees':0},

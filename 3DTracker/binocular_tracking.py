@@ -51,7 +51,7 @@ class CompanionEyeTracker:
         self.detector.pupil_confidence_threshold = threshold
         self.detector.pupil_confidence_threshold_sphere = threshold
         self.eye_model.threshold = threshold
-        self.detector.eye_sphere_adjustment_enabled = self.eye_model.phase == 'collecting'
+        self.rig.apply_eye_sphere_setting(eye, self.detector, self.eye_model)
         self.detector.process_frame(sample['frame'], timestamp=sample['time'])
         result = self.detector.get_last_tracking_result()
         self.eye_model.observe(result, sample['time'])

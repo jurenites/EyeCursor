@@ -34,7 +34,8 @@ class NativeAppLaunchTests(unittest.TestCase):
              patch.object(monitor_demo, 'USBCameraSource'), \
              patch.object(monitor_demo, 'EyeCameraRig', return_value=capture), \
              patch.object(monitor_demo, 'ReconnectingCapture', return_value=capture), \
-             patch.object(monitor_demo, 'HeadCamera') as head, \
+             patch.object(monitor_demo, 'HeadCamera'), \
+             patch.object(monitor_demo, 'DualHeadCamera') as head, \
              patch.object(monitor_demo, 'HybridOnboarding'), \
              patch.object(monitor_demo, 'ThreadingHTTPServer') as server, \
              patch.object(monitor_demo.threading, 'Thread'), \

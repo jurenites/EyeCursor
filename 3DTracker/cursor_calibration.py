@@ -3,6 +3,24 @@ import numpy as np
 from gaze_mapping import project_unbounded, HeadResidualModel
 
 
+def motion_block_is_coherent(times, eyes, poses, pose_scale):
+    """Permit smooth counter-rotation, but reject a jump hidden by a median.
+
+    This is a short-window observation-quality check, never a target-error gate.
+    Eye and head trajectories are independently checked against capture time.
+    """
+    times=np.asarray(times);eyes=np.asarray(eyes);poses=np.asarray(poses)
+    if len(times)<6 or times[-1]-times[0]<.15:return False
+    if np.any(np.diff(times)<=0):return False
+    t=(times-times[0])/max(times[-1]-times[0],.001)
+    design=np.column_stack((np.ones(len(t)),t))
+    eye_error=eyes-design@np.linalg.lstsq(design,eyes,rcond=None)[0]
+    head=poses/pose_scale
+    head_error=head-design@np.linalg.lstsq(design,head,rcond=None)[0]
+    return bool(np.max(np.linalg.norm(eye_error,axis=1))<.006 and
+                np.max(np.linalg.norm(head_error,axis=1))<.15)
+
+
 class CursorMap:
     def __init__(self, eyes, targets):
         eyes,targets=np.asarray(eyes,dtype=float),np.asarray(targets,dtype=float)
@@ -140,6 +158,8 @@ class CursorCalibration:
         self.hold=[]
         self.target=None
         self.since=None
+        self.target_since=None
+        self.pose_revisit=False
         self.last_sample=None
         self.candidate=None
         self.base_mapping=base_mapping
@@ -159,7 +179,8 @@ class CursorCalibration:
         return self.since is not None and getattr(self,'captured_since',None)==self.since and self.progress>=1
 
     def reset_fixation(self):
-        self.target=None;self.since=None;self.captured_since=None
+        self.target=None;self.since=None;self.target_since=None;self.captured_since=None
+        self.pose_revisit=False
         self.hold=[];self.progress=0.;self.accepted=False
 
     def observe(self,target,eye,stamp,now,pose=None,evidence=None):
@@ -172,13 +193,14 @@ class CursorCalibration:
         # as the native pointer. Compare with the saved point, not the last frame.
         if self.target is None or np.linalg.norm((target-self.target)*self.viewport_size)>5.:
             self.reset_fixation()
-            self.target=target;self.since=now;self.hold=[];self.progress=0.
+            self.target=target;self.since=now;self.target_since=now;self.hold=[];self.progress=0.
         if self.target_complete:
             reference=getattr(self,'captured_pose',None)
             valid_pose=pose is not None and np.shape(pose)==(6,) and np.isfinite(pose).all()
             if (valid_pose and reference is not None
-                    and np.linalg.norm((pose-reference)/PoseAnchorMap.pose_scale)>.6):
+                    and np.linalg.norm((pose-reference)/PoseAnchorMap.pose_scale)>.25):
                 self.captured_since=None;self.since=now;self.hold=[];self.progress=0.
+                self.pose_revisit=True
             else:
                 # A saved reference stays successful through blinks, confidence
                 # drops and duplicate frames. This is not a new camera sample.
@@ -186,7 +208,9 @@ class CursorCalibration:
         if eye is None:
             if self.hold and now-self.hold[-1][0]>.25:self.hold=[];self.progress=0.
             return
-        if stamp==self.last_sample or now-self.since<.25:return
+        if self.target_since is None:self.target_since=self.since
+        if stamp is None or not np.isfinite(stamp) or not 0<=now-stamp<=.15:return
+        if (self.last_sample is not None and stamp<=self.last_sample) or now-self.target_since<.25:return
         eye=np.asarray(eye,dtype=float)
         if eye.shape!=(2,) or not np.isfinite(eye).all():self.hold=[];self.progress=0.;return
         if pose is not None:
@@ -198,19 +222,33 @@ class CursorCalibration:
         self.hold.append((now,np.asarray(eye),pose,target.copy(),
                           dict(evidence or {},captured_at=stamp)))
         self.hold=[p for p in self.hold if now-p[0]<1.5]
-        self.progress=min(1,len(self.hold)/6,(now-self.hold[0][0])/1.)
-        if len(self.hold)<6 or now-self.hold[0][0]<1.:return
-        eyes=np.array([p[1] for p in self.hold])
-        if np.max(np.std(eyes,axis=0))>.008:
-            self.progress=0.;self.accepted=False
-            self.message='Keep looking at the mouse while it is still';return
+        # A stationary known target is compatible with moving eyes and head.
+        # Once the user has had time to acquire it, use short paired blocks rather
+        # than demanding a full second of frozen pupils during counter-rotation.
+        tail=[p for p in self.hold if now-p[0]<=.70]
+        moving=(self.base_mapping is not None and pose is not None and len(tail)>=6 and
+                all(p[2] is not None for p in tail) and
+                (self.pose_revisit or np.linalg.norm((tail[-1][2]-tail[0][2])/PoseAnchorMap.pose_scale)>.12))
+        dynamic=moving and now-self.target_since>=1.25
+        capture=tail if dynamic else self.hold
+        duration=.50 if dynamic else 1.
+        self.progress=min(1,len(capture)/6,(now-capture[0][0])/duration)
+        if len(capture)<6 or now-capture[0][0]<duration:return
+        eyes=np.array([p[1] for p in capture])
         measured_pose=None
         if pose is not None:
-            poses=np.array([p[2] for p in self.hold if p[2] is not None])
-            if len(poses)!=len(self.hold) or np.max(np.std(poses,axis=0)/PoseAnchorMap.pose_scale)>.25:
-                self.progress=0.;self.accepted=False
-                self.message='Hold this head position briefly while looking at the pointer';return
+            poses=np.array([p[2] for p in capture if p[2] is not None])
+            if len(poses)!=len(capture):return
             measured_pose=np.median(poses,axis=0)
+        if dynamic:
+            if not motion_block_is_coherent([p[4]['captured_at'] for p in capture],eyes,poses,PoseAnchorMap.pose_scale):
+                self.progress=0.;self.accepted=False
+                self.message='Waiting for clear paired eye and head movement';return
+        elif np.max(np.std(eyes,axis=0))>.008 or (measured_pose is not None and
+                np.max(np.std(poses,axis=0)/PoseAnchorMap.pose_scale)>.25):
+            self.progress=0.;self.accepted=False
+            self.message='Keep watching the pointer; move your head gently';return
+        self.capture_kind='head_motion' if dynamic else 'fixation'
         self.captured_pose=measured_pose
         nearby=next((i for i,p in enumerate(self.points) if np.linalg.norm(target-p[1])<.12),None)
         if nearby is not None:
@@ -223,7 +261,7 @@ class CursorCalibration:
         self.target=target.copy()
         self.captured_since=self.since
         self.points=self.points[-40:]
-        capture=list(self.hold)
+        capture=list(capture)
         self.hold=[]
         self.last_capture=[]
         # A rejected new anchor cannot replace the previously accepted map.
@@ -233,7 +271,7 @@ class CursorCalibration:
             if measured_pose is not None and self.base_mapping is not None:
                 center=np.median(eyes,axis=0)
                 anchors=[p for p in self.pose_points if not (np.linalg.norm(p[2]-target)<.08 and
-                    np.linalg.norm((p[1]-measured_pose)/PoseAnchorMap.pose_scale)<.5)]
+                    np.linalg.norm((p[1]-measured_pose)/PoseAnchorMap.pose_scale)<.15)]
                 anchors.append((center,measured_pose,target.copy()))
                 self.candidate=PoseAnchorMap(self.base_mapping,anchors)
                 self.pose_points=anchors[-100:]
@@ -248,13 +286,13 @@ class CursorCalibration:
             self.saved_count+=1
             self.last_capture=capture
             self.progress=1.
-            self.message='Saved. Move the pointer or your head, pause again, or finish.'
+            self.message='Saved. Keep watching the pointer and gently move your head, or stop learning.'
         except ValueError as error:
             self.candidate=previous_candidate
             if self.base_mapping is None and len(self.points)<6:
                 if measured_pose is not None:
                     self.pose_points=[p for p in self.pose_points if not (np.linalg.norm(p[2]-target)<.12 and
-                        np.linalg.norm((p[1]-measured_pose)/PoseAnchorMap.pose_scale)<.5)]
+                        np.linalg.norm((p[1]-measured_pose)/PoseAnchorMap.pose_scale)<.15)]
                     self.pose_points.append((np.median(eyes,axis=0),measured_pose,target.copy()))
                 self.saved_count+=1;self.progress=1.
                 self.last_capture=capture
@@ -270,5 +308,6 @@ class CursorCalibration:
                 'stage':self.stage,'head_cue':self.head_cue,'progress':self.progress,
                 'live_preview':bool(self.active and self.candidate is not None),
                 'sample_accepted':self.accepted,'saved_anchors':len(self.pose_points) if self.pose_points else self.saved_count,
+                'capture_kind':getattr(self,'capture_kind',None),
                 'fixed_target':self.fixed_target,'target_complete':self.target_complete,
                 'target_position':self.target.tolist() if self.target is not None else None}

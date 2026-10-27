@@ -92,3 +92,34 @@ class CursorCalibrationTests(unittest.TestCase):
         for i in range(20,40):
             flow.observe([.5,.5],[.5,.5] if i%6==0 else None,i*.1,i*.1)
         self.assertIsNone(flow.candidate)
+
+class MovingCursorTargetTests(unittest.TestCase):
+    def test_stationary_pointer_learns_continuous_nodding_and_stops_on_toggle(self):
+        base=CursorMap(TARGETS*[.18,.14]+[.38,.35],TARGETS)
+        flow=CursorCalibration(base);flow.active=True
+        ref=np.array([0.,0.,0.,.5,.4,-1.5]);target=np.array([.5,.5])
+        for t in np.arange(0,14,.1):
+            head=ref.copy();head[1]=.22*np.sin(t*1.2)
+            eye=(target+[0,head[1]*1.1])*[.18,.14]+[.38,.35]
+            flow.observe(target,eye,t,t,pose=head)
+        self.assertGreater(flow.saved_count,8)
+        self.assertGreater(flow.candidate.head_model.rank,0)
+        for pitch in (-.13,.09):
+            head=ref.copy();head[1]=pitch
+            unseen=np.array([.7,.3]);eye=(unseen+[0,pitch*1.1])*[.18,.14]+[.38,.35]
+            np.testing.assert_allclose(flow.candidate.project_pose(eye,head,False),unseen,atol=.025)
+        count=flow.saved_count;flow.active=False
+        for t in np.arange(15,18,1/30):flow.observe([.2,.8],[.6,.5],t,t,pose=ref)
+        self.assertEqual(flow.saved_count,count)
+        resumed=CursorCalibration(flow.candidate)
+        self.assertFalse(resumed.active)
+        self.assertEqual(len(resumed.pose_points),len(flow.pose_points))
+
+    def test_short_motion_blocks_reject_abrupt_pupil_failures(self):
+        from cursor_calibration import motion_block_is_coherent,PoseAnchorMap
+        times=np.arange(10)/30
+        eyes=np.c_[.5+times*.06,.4+times*.12]
+        heads=np.zeros((10,6));heads[:,1]=times*.3
+        self.assertTrue(motion_block_is_coherent(times,eyes,heads,PoseAnchorMap.pose_scale))
+        eyes[5:]+=[.06,-.08]
+        self.assertFalse(motion_block_is_coherent(times,eyes,heads,PoseAnchorMap.pose_scale))

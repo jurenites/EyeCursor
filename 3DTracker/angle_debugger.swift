@@ -157,6 +157,9 @@ final class AngleDebugger: NSObject, SCNSceneRendererDelegate {
     private var cameraMeasurements = MeasurementChannels()
     // A visualization scale, not the gaze calibration reference. Capturing a
     // target must not teleport an otherwise unchanged face.
+    private var motionGuideAnchor: (SIMD3<Float>, simd_quatf)?
+    private var motionGuideCue: String?
+    private var motionGuideStarted: Double = 0
     private var sceneReferenceWidth: Double?
     private var sceneReferenceCamera: String?
     private var cameraContexts: [String: String] = [:]
@@ -479,7 +482,7 @@ final class AngleDebugger: NSObject, SCNSceneRendererDelegate {
                 mappingMetrics.stringValue += String(format:"\n\(side.capitalized): %.1f%%, %.1f%%%@",estimate.uv[0]*100,estimate.uv[1]*100,outside ? " · fenced at edge" : "")
             } else {
                 let status = state.onboarding?.eye_map_status?[side]
-                mappingMetrics.stringValue += "\n\(side.capitalized): \(status == "Needs target samples" ? "use Learn from dots" : "waiting for paired estimate")"
+                mappingMetrics.stringValue += "\n\(side.capitalized): \(status == "Needs target samples" ? "needs target samples" : "waiting for paired estimate")"
             }
         }
         if let error = savedReferences.last?.error_px, error.isFinite {
@@ -714,10 +717,11 @@ final class AngleDebugger: NSObject, SCNSceneRendererDelegate {
         shape.materials = [material(alpha,wire: wire)]
         let n = SCNNode(geometry: shape); n.simdPosition = position; geometry.addChildNode(n); return n
     }
-    func ball(_ p: SIMD3<Float>, _ r: CGFloat, alpha: CGFloat = 0.8, wire: Bool = false) -> SCNNode {
+    func ball(_ p: SIMD3<Float>, _ r: CGFloat, alpha: CGFloat = 0.8, wire: Bool = false, color: NSColor = .white) -> SCNNode {
         if wire {
             let n = SCNNode(); n.simdPosition = p; geometry.addChildNode(n)
-            outlineLock.lock(); outlines.append((n,Float(r),material(min(0.8,alpha*4)))); outlineLock.unlock()
+            let outlineMaterial = material(min(0.8,alpha*4)); outlineMaterial.diffuse.contents = color
+            outlineLock.lock(); outlines.append((n,Float(r),outlineMaterial)); outlineLock.unlock()
             return n
         }
         let sphere = SCNSphere(radius: r); sphere.segmentCount = 24
@@ -812,7 +816,55 @@ final class AngleDebugger: NSObject, SCNSceneRendererDelegate {
         }
     }
 
+    // Instruction geometry only. It never feeds the measured head, gaze rays,
+    // screen markers or calibration model. Keep it visibly distinct and named.
+    func drawMotionGuide(head: SIMD3<Float>, rotation: simd_quatf, at time: Double) {
+        guard state?.onboarding?.phase == "motion",
+              let cue = state?.onboarding?.cursor_calibration?.head_cue else { return }
+        if motionGuideAnchor == nil { motionGuideAnchor = (head,rotation) }
+        if cue != motionGuideCue { motionGuideCue = cue; motionGuideStarted = time }
+        let (anchor,baseRotation) = motionGuideAnchor!
+        let wave = Float(sin((time-motionGuideStarted) * .pi/2))
+        var position = anchor, orientation = baseRotation
+        var title = "Guide: keep watching the center"
+        switch cue {
+        case "depth":
+            position.z += 4*wave
+            title = "Guide: closer / farther, face level"
+            line(anchor-[0,0,4],anchor+[0,0,4],alpha:0.55,radius:0.07,color:.systemTeal,name:"head-guide-depth-axis")
+        case "shift":
+            position.x += 4*wave
+            title = "Guide: slide sideways, face forward"
+            line(anchor-[4,0,0],anchor+[4,0,0],alpha:0.55,radius:0.07,color:.systemTeal,name:"head-guide-shift-axis")
+        case "pitch":
+            orientation = baseRotation * simd_quatf(angle:wave*0.12,axis:[1,0,0])
+            title = "Guide: nod, eyes on center"
+        case "yaw":
+            orientation = baseRotation * simd_quatf(angle:wave*0.12,axis:[0,1,0])
+            title = "Guide: turn, eyes on center"
+        default: return
+        }
+        let ghost = ball(position,1,alpha:0.16,wire:true,color:.systemTeal)
+        ghost.name = "instruction-head-ghost"; ghost.simdScale = [7.7,10,7]
+        ghost.simdOrientation = orientation
+        // These teal reference sight lines illustrate the instruction, not a prediction.
+        let target: SIMD3<Float> = [0,0,0]
+        for sign: Float in [-1,1] {
+            let eye = position+orientation.act([sign*eyeSeparation()/2,2,-5.8])
+            let marker = ball(eye,0.65,alpha:0.3,wire:true,color:.systemTeal)
+            marker.name = "instruction-eye"
+            line(eye,target,alpha:0.2,radius:0.025,color:.systemTeal,name:"instruction-sight-line")
+        }
+        let text = SCNText(string:title,extrusionDepth:0)
+        text.font = .systemFont(ofSize:1.2); text.flatness = 0.3
+        let label = node(text,anchor+[-10,12,0],alpha:0.8)
+        label.name = "instruction-head-label"
+        label.geometry?.firstMaterial?.diffuse.contents = NSColor.systemTeal
+        label.constraints = [SCNBillboardConstraint()]
+    }
+
     func rebuild(at time: Double = ProcessInfo.processInfo.systemUptime) {
+        if state?.onboarding?.phase != "motion" { motionGuideAnchor = nil; motionGuideCue = nil }
         metrics.isHidden = rawDirections.state != .on
         updateLabels()
         outlineLock.lock(); outlines.removeAll(); outlineLock.unlock()
@@ -876,6 +928,7 @@ final class AngleDebugger: NSObject, SCNSceneRendererDelegate {
             return
         }
         let (head,rotation) = headGeometry(features)
+        drawMotionGuide(head:head, rotation:rotation, at:time)
         let eyeRadius: CGFloat = 1.2
         let skull = ball(head,1,alpha: 0.12,wire: true); skull.simdScale = [7.7,10,7]; skull.simdOrientation = rotation
         skull.name = "tracked-head"

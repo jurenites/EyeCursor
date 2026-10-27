@@ -15,11 +15,19 @@ class HeadMotionMap:
         self.reference=np.array(head_fit.reference,copy=True)
         self.head_coefficients=np.array(head_fit.coefficients,copy=True)
         self.eye_center=np.asarray(seeds[0][0]);self.validation_error=None
+        self.quadratic_interactions=True
         self.eyes=np.array([s[0] for s in seeds]);self.error=None
 
     def design(self,poses):
         x=(np.asarray(poses)-self.reference)/POSE_SCALE
-        return np.concatenate((np.ones((*x.shape[:-1],1)),x,x*x),axis=-1) if self.degree==2 else np.concatenate((np.ones((*x.shape[:-1],1)),x),axis=-1)
+        columns=[np.ones((*x.shape[:-1],1)),x]
+        if self.degree==2:
+            columns.append(x*x)
+            if getattr(self,'quadratic_interactions',False):
+                # Rotation and translation combine: independent axis squares
+                # cannot represent yaw×shift or yaw×pitch counter-rotation.
+                columns.append(np.stack([x[...,i]*x[...,j] for i in range(6) for j in range(i)],axis=-1))
+        return np.concatenate(columns,axis=-1)
 
     def reference_project(self,point):
         if hasattr(self.base,'project_pose_unbounded'):
@@ -75,7 +83,8 @@ class HeadMotionMap:
         model.bounds=np.percentile(poses,[0,100],axis=0)
         model.fit_metrics={'model':'empirical_head_displacement','motion_blocks':len(blocks),
             'inner_check_pupil_error':best[0],'degree':model.degree,'ridge':model.ridge,
-            'downweighted_blocks':int(np.sum(residual>.008))}
+            'downweighted_blocks':int(np.sum(residual>.008)),
+            'feature_schema':'head_quadratic_cross_v2'}
         return model
 
     def project_raw(self,raw,pose):
@@ -83,9 +92,15 @@ class HeadMotionMap:
         if raw.shape!=(2,) or pose.shape!=(6,) or not np.isfinite(np.r_[raw,pose]).all():return None
         # Do not extrapolate a polynomial far beyond observed head positions.
         if np.any(pose<self.bounds[0]-.5*POSE_SCALE) or np.any(pose>self.bounds[1]+.5*POSE_SCALE):
-            corrected=raw-(pose-self.reference)/HEAD_SCALE@self.head_coefficients
-            return (self.base.project_pose_unbounded(corrected,pose,True) if hasattr(self.base,'project_pose_unbounded')
-                    else project_unbounded(self.base,corrected))
+            # A still-head map is not a valid substitute at an unseen head pose.
+            # The caller may explicitly use it only inside its supported region.
+            return None
+        return self.evaluate_raw(raw,pose)
+
+    def evaluate_raw(self,raw,pose):
+        """Evaluate a held-out pose before deciding whether to extend support."""
+        raw,pose=np.asarray(raw),np.asarray(pose)
+        if raw.shape!=(2,) or pose.shape!=(6,) or not np.isfinite(np.r_[raw,pose]).all():return None
         corrected=raw-(pose-self.reference)/HEAD_SCALE@self.head_coefficients-self.design(pose)@self.coefficients
         return self.reference_project(corrected)
 

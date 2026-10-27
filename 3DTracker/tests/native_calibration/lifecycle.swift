@@ -76,18 +76,66 @@ precondition(controller.versionMenu.title == "EyeCursor \(controller.buildVersio
 precondition(controller.statusItem!.menu!.items.contains(controller.versionMenu))
 precondition(controller.headPracticeMenu.title == "Calibrate head movement")
 let longMenuStatus = String(repeating: "Eye camera is temporarily unavailable. ", count: 5)
+// Observe every native title mutation, not just the final shortened string.
+let trayMenuUnderTest = controller.statusItem!.menu!
+var publishedStatusTitles: [String] = []
+let titleObserver = NotificationCenter.default.addObserver(forName: NSMenu.didChangeItemNotification,
+    object: trayMenuUnderTest, queue: nil) { _ in
+        publishedStatusTitles.append(controller.statusMenu.title)
+    }
 controller.localError = longMenuStatus
 controller.updateMenu()
+NotificationCenter.default.removeObserver(titleObserver)
+precondition(!publishedStatusTitles.contains(longMenuStatus),
+             "Never publish unbounded text to AppKit, even briefly before truncating it")
 let menuFont = controller.statusItem!.menu!.font ?? NSFont.menuFont(ofSize: 0)
 let menuTextWidth = { (title: String) in
     (title as NSString).size(withAttributes: [.font: menuFont]).width
 }
 precondition(menuTextWidth(controller.statusMenu.title) <= menuTextWidth(controller.headPracticeMenu.title),
              "Transient tracker messages must not widen the menu beyond its action labels")
+let reviewMenu = controller.statusItem!.menu!.items.first { $0.title == "Record & replay…" }!
+precondition(reviewMenu.action == #selector(CalibrationApp.openRecordingReview))
+precondition(menuTextWidth(reviewMenu.title) <= menuTextWidth(controller.headPracticeMenu.title),
+             "Recording action must fit the compact menu")
 precondition(controller.statusMenu.toolTip == longMenuStatus,
              "The complete tracker message must remain available on hover")
 controller.localError = nil
 controller.updateMenu()
+// Compare the native layout against a fresh menu containing only concise items.
+let compactReferenceMenu = NSMenu()
+compactReferenceMenu.autoenablesItems = false
+for item in trayMenuUnderTest.items { compactReferenceMenu.addItem(item.copy() as! NSMenuItem) }
+let compactMenuWidth = compactReferenceMenu.size.width
+precondition(trayMenuUnderTest.minimumWidth == 0)
+precondition(trayMenuUnderTest.size.width <= compactMenuWidth + 1)
+let visibleActionWidth = trayMenuUnderTest.items.filter { !$0.isHidden && $0.action != nil }
+    .map { menuTextWidth($0.title) }.max()!
+// Unbundled lifecycle binaries show the longer "vdevelopment" build label.
+let conciseLabelWidth = max(visibleActionWidth, menuTextWidth(controller.versionMenu.title))
+for item in trayMenuUnderTest.items where !item.isHidden && !item.isSeparatorItem {
+    precondition(menuTextWidth(item.title) <= conciseLabelWidth,
+                 "Every visible item, including disabled labels, must fit the concise actions")
+}
+// Mutate the actual open menu: AppKit can cache intermediate widths while tracking.
+var checkedOpenMenu = false
+let menuWidthTimer = Timer(timeInterval: 0.05, repeats: false) { _ in
+    for message in [longMenuStatus, String(repeating: "Device / error / progress 🟠 WWW ", count: 30), "Ready"] {
+        controller.localError = message
+        controller.updateMenu()
+        precondition(trayMenuUnderTest.size.width <= compactMenuWidth + 1,
+                     "Updating an open menu must not expand its native width")
+        precondition(menuTextWidth(controller.statusMenu.title) <= visibleActionWidth)
+    }
+    checkedOpenMenu = true
+    trayMenuUnderTest.cancelTracking()
+}
+RunLoop.main.add(menuWidthTimer, forMode: .common)
+trayMenuUnderTest.popUp(positioning: nil, at: NSPoint(x: 300, y: 300), in: nil)
+precondition(checkedOpenMenu, "The native menu must actually open for the width regression check")
+controller.localError = nil
+controller.updateMenu()
+print("Native menu width passed: \(compactMenuWidth) pt with normal and long/error text while open.")
 precondition(controller.versionLabel.superview === controller.diagnosticWindow.contentView,
              "The version must stay outside both scrolling panels")
 precondition(abs(controller.versionLabel.alignmentRect(forFrame: controller.versionLabel.frame).maxX - (controller.diagnosticWindow.contentView!.bounds.maxX - 12)) < 1)
@@ -108,11 +156,21 @@ precondition((controller.angleDebugger.sidebar.arrangedSubviews.first as? NSButt
              "Reset laboratory must be the first control in the right sidebar")
 let longCameraName = String(repeating: "Very long USB camera name ", count: 12)
 let rigFixture = EyeCamerasState(active_eye: "left", eyes: [
-    "left": EyeCameraSlot(device_id: "left-usb", rotation: 180, connected: true, fps: 30, status: "Connected", error: nil),
+    "left": EyeCameraSlot(device_id: "left-usb", rotation: 180, connected: true, fps: 30, status: "Connected", error: nil, fixed_eye_sphere: true),
     "right": EyeCameraSlot(device_id: "right-usb", rotation: 0, connected: false, fps: 0, status: "Disconnected", error: longCameraName)
 ], devices: [EyeCameraDevice(id: "left-usb", name: longCameraName)], error: nil)
 controller.renderEyeSetup(rigFixture)
 precondition(controller.leftRotation.state == .on && controller.rightRotation.state == .off)
+precondition(controller.leftFixedSphere.state == .on && controller.rightFixedSphere.state == .off)
+precondition(controller.leftFixedSphere.superview === controller.eyeSetupStack &&
+             controller.rightFixedSphere.superview === controller.eyeSetupStack,
+             "Each camera must expose its fixed eye sphere setting inside Camera setup")
+precondition(controller.leftFixedSphere.isEnabled && controller.rightFixedSphere.isEnabled)
+controller.eyeSetupPending = true
+controller.renderEyeSetup(rigFixture)
+precondition(!controller.leftFixedSphere.isEnabled && !controller.rightFixedSphere.isEnabled)
+controller.eyeSetupPending = false
+controller.renderEyeSetup(rigFixture)
 precondition(controller.leftCameraChoice.selectedItem?.representedObject as? String == "left-usb")
 precondition(controller.rightCameraChoice.selectedItem?.representedObject as? String == "right-usb",
              "Remember an unplugged eye without silently selecting the other device")
@@ -123,6 +181,12 @@ precondition(controller.trackingEyeTitle.stringValue.contains("180°"))
 controller.diagnosticWindow.contentView!.layoutSubtreeIfNeeded()
 precondition(!controller.eyeSetupStack.isHidden && controller.eyeSetupStack.superview != nil)
 precondition(controller.preview.bounds.width <= 240, "Long device names must not stretch the sidebar")
+if let path = ProcessInfo.processInfo.environment["EYECURSOR_CAMERA_SETUP_SNAPSHOT"] {
+    let view = controller.eyeSetupStack
+    let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds)!
+    view.effectiveAppearance.performAsCurrentDrawingAppearance { view.cacheDisplay(in: view.bounds, to: bitmap) }
+    try! bitmap.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: path))
+}
 controller.toggleEyeSetup()
 controller.diagnosticWindow.contentView!.layoutSubtreeIfNeeded()
 precondition(controller.eyeSetupStack.isHidden)
@@ -179,6 +243,39 @@ controller.menuDidClose(openMenu)
 precondition(!controller.eyeCameraMenuOpen)
 controller.deferredEyeSetup = nil
 controller.renderEyeSetup(rigFixture)
+let secondHeadFixture = SecondHeadState(camera_id: "table-webcam",
+    camera: SecondWebcamState(connected: true, face_visible: true, fps: 5, error: nil),
+    devices: [EyeCameraDevice(id: "table-webcam", name: longCameraName)], error: nil,
+    collecting: true, aligned: false, samples: 82, message: longMenuStatus,
+    assistance: HeadAssistanceState(reason: "not_aligned", weight: 0))
+controller.renderSecondHead(secondHeadFixture)
+precondition(controller.secondHeadChoice.selectedItem?.representedObject as? String == "table-webcam")
+precondition(controller.secondHeadChoice.title.count < 40)
+precondition(controller.secondHeadChoice.selectedItem!.toolTip!.contains(longCameraName))
+precondition(controller.secondHeadLearn.title == "Finish alignment")
+precondition(controller.secondHeadRate.stringValue.contains("82 paired frames"))
+precondition(!controller.secondHeadPanel.isHidden)
+controller.diagnosticWindow.contentView!.layoutSubtreeIfNeeded()
+precondition(controller.preview.bounds.width <= 240, "Second webcam names and messages must not widen diagnostics")
+precondition(abs(controller.secondHeadPreview.bounds.width-controller.preview.bounds.width) < 1)
+precondition(abs(controller.secondHeadPreview.bounds.height-controller.secondHeadPreview.bounds.width*0.75) < 1)
+let expandedCameraStackHeight = controller.cameraStack!.fittingSize.height
+let headMenu = controller.secondHeadChoice.menu!
+let headItems = headMenu.items
+controller.menuWillOpen(headMenu)
+controller.renderSecondHead(nil)
+precondition(controller.eyeCameraMenuOpen && headMenu.items == headItems,
+             "An open second webcam selector must remain stable while polling")
+controller.menuDidClose(headMenu)
+precondition(!controller.eyeCameraMenuOpen)
+controller.renderSecondHead(nil)
+precondition(controller.secondHeadPanel.isHidden && !controller.secondHeadLearn.isEnabled)
+controller.diagnosticWindow.contentView!.layoutSubtreeIfNeeded()
+precondition(controller.cameraStack!.fittingSize.height < expandedCameraStackHeight - 100,
+             "Disabling the second webcam must remove the fourth preview's reserved sidebar space")
+controller.updateMenu()
+precondition(menuTextWidth(controller.statusMenu.title) <= menuTextWidth(controller.headPracticeMenu.title),
+             "Second webcam diagnostics must not widen the menu-bar dropdown")
 let initialIR = controller.preview.convert(controller.preview.bounds, to: controller.diagnosticWindow.contentView)
 let initialWebcam = controller.facePreview.convert(controller.facePreview.bounds, to: controller.diagnosticWindow.contentView)
 controller.resizeCameraSidebar(to: 400)
@@ -224,7 +321,7 @@ let laptopScreen = NSScreen.screens.first { candidate in
     return CGDisplayIsBuiltin(number.uint32Value) != 0
 } ?? screen
 let id = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as! NSNumber).stringValue
-func state(_ phase: String, valid: Bool = true, headPitch: Double = 0, headX: Double = 0.5, cursor: Bool = false, tracked: Bool = true, irEye: Bool = false, circleStart: Double? = nil, fixedTarget: [Double]? = nil, savedTarget: [Double]? = nil, rawGaze: [Double]? = nil, references: Bool = false, webcamRays: [[Double]] = [[0,0,-1],[0,0,-1]], referenceCount: Int = 1, referenceSession: String = "test", referenceShift: Double = 0, geometric: Bool = false, continuous: Bool = false, headApplied: Bool = false, accuracy: [String:Any]? = nil, eyeSide: String? = nil, calibrationProgress: Double = 0.9, accepted: Bool = true, targetIndex: Int = 2, calibrationTarget: [Double]? = nil, cursorProgress: Double = 0.4, irSlots: [String: Any] = [:], eyePredictions: [String: Any] = [:], binocularStatus: String? = nil, headWidth: Double = log(0.3), headReference: [Double]? = nil, guidedOutcome: String? = nil) -> TrackerState {
+func state(_ phase: String, valid: Bool = true, headPitch: Double = 0, headX: Double = 0.5, cursor: Bool = false, tracked: Bool = true, irEye: Bool = false, circleStart: Double? = nil, fixedTarget: [Double]? = nil, savedTarget: [Double]? = nil, rawGaze: [Double]? = nil, references: Bool = false, webcamRays: [[Double]] = [[0,0,-1],[0,0,-1]], referenceCount: Int = 1, referenceSession: String = "test", referenceShift: Double = 0, geometric: Bool = false, continuous: Bool = false, headApplied: Bool = false, accuracy: [String:Any]? = nil, eyeSide: String? = nil, calibrationProgress: Double = 0.9, accepted: Bool = true, targetIndex: Int = 2, calibrationTarget: [Double]? = nil, cursorProgress: Double = 0.4, irSlots: [String: Any] = [:], eyePredictions: [String: Any] = [:], binocularStatus: String? = nil, headWidth: Double = log(0.3), headReference: [Double]? = nil, guidedOutcome: String? = nil, motionCue: String = "shift") -> TrackerState {
     let complete = phase == "complete"
     let captured: [[String:Any]] = references ? (0..<referenceCount).map { i in
         var head = neutralHead; head[3] += referenceShift + Double(i)*0.0001
@@ -256,7 +353,7 @@ func state(_ phase: String, valid: Bool = true, headPitch: Double = 0, headX: Do
                        "geometry_calibration":geometric ? ["continuous":continuous,"total_samples":240,"applied_updates":2,"phase":"validate","message":"Checking fresh measurements","remaining_seconds":4.0,"applied":headApplied] as Any : NSNull(),
                        "geometry_model":geometric ? ["depth_screen_widths":1.4,"reference_log_face_width":log(0.3),"camera_aspect":16.0/9.0,"eye_separation_screen_widths":6.4/30.2] as Any : NSNull(),
                        "cursor_calibration": ["active":cursor,"positions":1,"ready":true,"message":"Live alignment",
-                                              "stage":geometric ? "geometry" : "positions","remaining_seconds":4.0,"head_cue":NSNull(),"progress":cursorProgress,"live_preview":true,
+                                              "stage":geometric ? "geometry" : "positions","remaining_seconds":4.0,"head_cue":phase == "motion" ? motionCue as Any : NSNull(),"progress":cursorProgress,"live_preview":true,
                                               "fixed_target":fixedTarget as Any? ?? NSNull(),
                                               "sample_accepted":valid && accepted,"target_complete":savedTarget != nil,
                                               "target_position":savedTarget as Any? ?? NSNull()]]
@@ -594,11 +691,11 @@ precondition(!controller.active && !controller.window.isVisible)
 precondition(controller.calibrationSteps.actionButton.title == "Start calibration")
 precondition(controller.calibrateMenu.title == "Start calibration")
 precondition(controller.calibrationSteps.headButton.superview === controller.calibrationSteps)
-precondition(!controller.calibrationSteps.headButton.isHidden && !controller.calibrationSteps.headButton.isEnabled)
+precondition(controller.calibrationSteps.headButton.isHidden && !controller.calibrationSteps.headButton.isEnabled)
 precondition(controller.calibrationSteps.countdown.stringValue.contains("when you are prepared"))
 precondition(controller.calibrationSteps.headButton.action == #selector(CalibrationApp.practiceHeadMovement))
 controller.calibrationSteps.layoutSubtreeIfNeeded()
-precondition(controller.calibrationSteps.headButton.frame.minY > controller.calibrationSteps.rows[0].frame.maxY)
+precondition(controller.calibrationSteps.headButton.isHidden, "Head learning belongs to the guided flow")
 deliver(state("screen"))
 precondition(controller.calibrationSteps.actionButton.title == "Stop calibration")
 precondition(controller.calibrationSteps.manualButton.isHidden)
@@ -618,7 +715,7 @@ if let path = ProcessInfo.processInfo.environment["EYECURSOR_MANUAL_SNAPSHOT"] {
     try! bitmap.representation(using:.png,properties:[:])!.write(to:URL(fileURLWithPath:path))
 }
 
-precondition(controller.calibrationSteps.rows.filter { !$0.isHidden }.count == 3)
+precondition(controller.calibrationSteps.rows.filter { !$0.isHidden }.count == 2)
 precondition(controller.calibrationSteps.rows[0].stringValue.hasPrefix("1. Follow five dots"))
 precondition(controller.calibrationSteps.actionButton.isEnabled)
 let pathStart = ProcessInfo.processInfo.systemUptime - 0.15
@@ -675,6 +772,16 @@ precondition(controller.eyeDots["left"]!.frame.midX == controller.eyeDots["right
 precondition(controller.eyeDots["left"]!.frame.midY == controller.eyeDots["right"]!.frame.midY)
 precondition(controller.eyeDots["left"]!.frame.width == controller.eyeDots["right"]!.frame.width,
              "Both eyes must use the same ring size even when their estimates overlap")
+let separatedEyes = ["left":eyePrediction("left",[0.2,0.3]),"right":eyePrediction("right",[0.8,0.7])]
+for side in ["left","right"] { controller.eyeMotions[side]?.reset() }
+deliver(state("complete",eyeSide:"left",eyePredictions:separatedEyes,binocularStatus:"disagreement"))
+controller.animateCursor()
+precondition(controller.dot.isVisible, "Disagreeing live eye maps must still display the white midpoint")
+let leftRing = controller.eyeDots["left"]!.frame, rightRing = controller.eyeDots["right"]!.frame
+// AppKit rounds the three window origins independently to display pixels.
+precondition(abs(controller.dot.frame.midX-(leftRing.midX+rightRing.midX)/2)<=1 &&
+             abs(controller.dot.frame.midY-(leftRing.midY+rightRing.midY)/2)<=1,
+             "White cursor must use the same eased midpoint as the two colored rings: white \(controller.dot.frame), left \(leftRing), right \(rightRing)")
 deliver(state("complete",valid:false,eyeSide:"left",binocularStatus:"disagreement"))
 precondition(controller.angleDebugger.cameraRayMetrics.stringValue.contains("Shared fixation uncertain") || controller.angleDebugger.rawDirections.state == .on)
 precondition(controller.angleDebugger.geometry.childNode(withName:"cursor-projection-ray",recursively:true) == nil,
@@ -686,7 +793,7 @@ for side in ["left","right"] { controller.eyeMotions[side]?.reset() }
 deliver(state("complete"))
 precondition(controller.diagnosticText.stringValue == "Calibration complete",
              "Completed IR status must not include changing gaze or pupil details")
-precondition(controller.calibrationSteps.actionButton.title == "Align with system cursor")
+precondition(controller.calibrationSteps.actionButton.title == "Restart calibration")
 precondition(controller.angleDebugger.geometry.childNode(withName: "calibrated-screen-gaze", recursively: true) != nil)
 precondition(controller.angleDebugger.geometry.childNode(withName: "webcam-eye-0", recursively: true) != nil)
 precondition(controller.angleDebugger.geometry.childNode(withName: "webcam-eye-1", recursively: true) != nil)
@@ -710,6 +817,11 @@ precondition(controller.angleDebugger.geometry.childNode(withName:"cursor-projec
 precondition(controller.angleDebugger.geometry.childNode(withName:"calibrated-screen-gaze",recursively:true) == nil)
 controller.hideCursor() // Restore the real clock after the deterministic future ticks.
 deliver(state("complete", cursor:true))
+precondition(controller.cursorAlignMenu.title == "Stop learning" && controller.cursorAlignMenu.state == .on)
+precondition(controller.calibrationSteps.actionButton.title == "Stop learning")
+precondition(menuTextWidth(controller.statusMenu.title) <= controller.statusItem!.menu!.items
+    .filter { !$0.isHidden && $0.action != nil }.map { menuTextWidth($0.title) }.max()!,
+    "Cursor learning status must fit the visible action widths")
 precondition(controller.calibrationSteps.manualButton.isHidden)
 precondition(controller.calibrationSteps.rows.filter { !$0.isHidden }.count == 4,
              "Cursor alignment must retain its own four instructions")
@@ -814,20 +926,49 @@ precondition(controller.calibrationSteps.heading.stringValue == "Calibration")
 precondition(controller.calibrationSteps.actionButton.title == "Stop calibration")
 precondition(controller.calibrationSteps.rows[0].stringValue.contains("✓"))
 precondition(controller.calibrationSteps.rows[1].stringValue.contains("Active"))
-precondition(controller.calibrationSteps.rows[2].stringValue.contains("check dots"))
+precondition(controller.calibrationSteps.rows[2].isHidden, "No automatic third target pass")
 precondition(controller.calibrationSteps.manualButton.isHidden && controller.calibrationSteps.headButton.isHidden)
 controller.animateCursorReference()
 precondition(!controller.cursorReference.isVisible,"Guided motion uses the main target, not a second cursor target")
 precondition(!controller.cursorAlignMenu.isEnabled && !controller.headPracticeMenu.isEnabled)
 precondition(controller.calibrationSteps.countdown.stringValue.contains("24s left · Checking movement"))
-precondition(controller.surface.headCue == "both")
+precondition(controller.surface.headCue == "shift", "Guided movement must show the current motion cue at the fixed target")
+deliver(state("motion",cursor:true,fixedTarget:[0.5,0.5],geometric:true,continuous:true,calibrationTarget:[0.5,0.5],motionCue:"depth"))
+precondition(controller.surface.headCue == "depth")
+let guideScene = controller.angleDebugger
+let guideState = guideScene.state
+guideScene.state = nil; guideScene.rebuild(at:99)
+guideScene.state = guideState
+guideScene.rebuild(at:100)
+let initialGuide = guideScene.geometry.childNode(withName:"instruction-head-ghost",recursively:true)!.simdPosition
+guideScene.rebuild(at:101)
+let guideNode = guideScene.geometry.childNode(withName:"instruction-head-ghost",recursively:true)!
+precondition((guideNode.geometry?.firstMaterial?.diffuse.contents as? NSColor) == NSColor.systemTeal)
+let forwardGuide = guideNode.simdPosition
+precondition(abs(forwardGuide.z-initialGuide.z-4)<0.01)
+precondition(forwardGuide.x == initialGuide.x && forwardGuide.y == initialGuide.y)
+precondition(guideScene.geometry.childNode(withName:"head-guide-depth-axis",recursively:true) != nil)
+let measuredHead = guideScene.geometry.childNode(withName:"tracked-head",recursively:true)!.simdPosition
+guideScene.rebuild(at:103)
+precondition(guideScene.geometry.childNode(withName:"tracked-head",recursively:true)!.simdPosition == measuredHead,
+             "The instructional ghost must never move the measured head")
+if let path = ProcessInfo.processInfo.environment["EYECURSOR_MOTION_GUIDE_SNAPSHOT"] {
+    guideScene.sceneView.frame = NSRect(x:0,y:0,width:900,height:650)
+    guideScene.camera.simdPosition = [65,48,115]; guideScene.camera.look(at:SCNVector3(6,6,12))
+    guideScene.sceneView.isPlaying = false
+    let picture = guideScene.sceneView.snapshot()
+    let bitmap = NSBitmapImageRep(data:picture.tiffRepresentation!)!
+    try! bitmap.representation(using:.png,properties:[:])!.write(to:URL(fileURLWithPath:path))
+}
 // Completing motion transitions to the accuracy target in the same overlay.
 deliver(state("verify",guidedOutcome:"previous_fit_kept"))
+controller.angleDebugger.rebuild()
+precondition(controller.angleDebugger.geometry.childNode(withName:"instruction-head-ghost",recursively:true) == nil)
 precondition(controller.calibrationSteps.rows[1].stringValue.contains("No correction learned"))
 precondition(!controller.calibrationSteps.rows[1].stringValue.contains("✓"),
              "Elapsed head capture is not a successfully learned correction")
 deliver(state("verify",guidedOutcome:"applied"))
-precondition(controller.calibrationSteps.accuracyButton.isHidden && controller.calibrationSteps.accuracySummary.isHidden,
+precondition(controller.calibrationSteps.accuracyButton.isHidden,
              "Guided accuracy has one Stop button and no overlapping report")
 precondition(controller.active && controller.window.isVisible)
 precondition(controller.calibrationSteps.rows[2].stringValue.contains("Active"))
@@ -839,7 +980,24 @@ precondition(controller.calibrationSteps.actionButton.title == "Stop calibration
 precondition(controller.accuracyButton.isHidden)
 precondition(!controller.dot.isVisible)
 deliver(state("complete"))
-precondition(controller.accuracyButton.title == "Learn from dots")
+precondition(controller.accuracyButton.title == "Check Accuracy")
+precondition(!controller.accuracyButton.isHidden, "Accuracy checking must be directly available without expanding a section")
+precondition(controller.calibrationSteps.actionButton.title == "Restart calibration")
+deliver(state("complete",guidedOutcome:"previous_fit_kept"))
+precondition(controller.calibrationSteps.actionButton.title == "Retry head movement",
+             "Failed motion learning should retry only that stage, retaining screen anchors")
+deliver(state("complete"))
+precondition(controller.calibrationSteps.manualButton.title == "Learn at cursor")
+precondition(!controller.calibrationSteps.manualButton.isHidden)
+precondition(controller.headPracticeMenu.isHidden)
+precondition(controller.accuracyButton.toolTip?.contains("without changing") == true)
+if let path = ProcessInfo.processInfo.environment["EYECURSOR_WORKFLOW_SNAPSHOT"] {
+    controller.diagnosticWindow.contentView!.layoutSubtreeIfNeeded()
+    let view=controller.calibrationSteps
+    let bitmap=view.bitmapImageRepForCachingDisplay(in:view.bounds)!
+    view.effectiveAppearance.performAsCurrentDrawingAppearance { view.cacheDisplay(in:view.bounds,to:bitmap) }
+    try! bitmap.representation(using:.png,properties:[:])!.write(to:URL(fileURLWithPath:path))
+}
 let physicalOrigin = controller.angleDebugger.referenceEyeOrigin(neutralHead)
 precondition(abs(physicalOrigin.z-controller.angleDebugger.value("distance"))<0.001,
              "A gaze fit must not change the independent illustration distance")
@@ -1043,12 +1201,12 @@ precondition(controller.calibrationSteps.countdown.stringValue.contains("Accurac
 precondition(controller.calibrationSteps.rows[2].stringValue.contains("Active"))
 deliver(state("complete", accuracy:accuracyFixture))
 precondition(controller.accuracyButton.isEnabled)
-precondition(controller.accuracySummary.stringValue.contains("Mean 42 pt"))
+precondition(controller.accuracyButton.toolTip?.contains("Mean 42 pt") == true)
 precondition(controller.accuracyButton.superview === controller.calibrationSteps,
              "Accuracy checking belongs to the right-side calibration controls")
 controller.calibrationSteps.layoutSubtreeIfNeeded()
 precondition(controller.accuracyButton.frame.maxY <= controller.calibrationSteps.actionButton.frame.minY)
-precondition(controller.accuracySummary.frame.maxY <= controller.accuracyButton.frame.minY)
+precondition(controller.accuracyButton.frame.maxY <= controller.calibrationSteps.manualButton.frame.minY)
 let cameraStack = controller.preview.superview as! NSStackView
 precondition(cameraStack.arrangedSubviews.first === controller.trackingEyeTitle,
              "The left eye feed must remain the first camera section")

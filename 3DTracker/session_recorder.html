@@ -35,6 +35,12 @@
   .toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 16px; margin: 14px 0; }
   .toolbar a { color: #9fd4ff; }
   .toolbar label { margin: 0; }
+  input[type=number] { width:85px; padding:7px; color:#fff; background:#17263b; border:1px solid #55708e; border-radius:5px; }
+  .range label { display:flex; align-items:center; gap:7px; }
+  #areas { display:grid; gap:8px; margin:14px 0; }
+  .area { display:flex; flex-wrap:wrap; gap:16px; align-items:center; padding:10px; border:1px solid #435c76; border-radius:8px; }
+  .area input { color:#fff; background:#17263b; border:1px solid #55708e; padding:6px; width:150px; }
+  #screen.selecting canvas { pointer-events:auto; cursor:crosshair; }
   .stats { display: flex; flex-wrap: wrap; gap: 9px; }
   .stats span { border: 1px solid #435c76; border-radius: 8px; padding: 6px 9px; background: #15263a; }
   @media(max-width:800px) { main { display:block; } aside { border-right:0; border-bottom:1px solid #33465f; } }
@@ -43,7 +49,7 @@
 <main>
   <aside>
     <h2>Record this display</h2>
-    <p>Finish the four-corner calibration, then select the same monitor here. Screen video, gaze samples, and cursor positions use one session timeline.</p>
+    <p>Finish calibration, then choose a monitor. Recording starts only when you press Start. Keep EyeCursor open until you stop recording.</p>
     <label>Display<select id="display"></select></label>
     <div class="buttons"><button id="start">Start recording</button><button id="stop" class="secondary" disabled>Stop</button></div>
     <div id="message" role="status"></div>
@@ -53,118 +59,31 @@
   <section id="viewer">
     <h2 id="title">Choose a session</h2>
     <div id="screen"><video id="video" controls playsinline preload="metadata"></video><canvas id="overlay"></canvas></div>
-    <div class="toolbar"><label><input type="checkbox" id="heatmap"> Heatmap through current time</label><label><input type="checkbox" id="cursor" checked> Cursor</label><label><input type="checkbox" id="gaze" checked> Gaze point</label><a id="tracking" hidden download="tracking.json">Download coordinates JSON</a></div>
+    <div class="toolbar">
+      <label><input type="checkbox" id="trail" checked> Measured path</label>
+      <label><input type="checkbox" id="heatmap"> Dwell heatmap</label>
+      <label><input type="checkbox" id="raw"> Include flagged points</label>
+      <label><input type="checkbox" id="cursor"> System cursor</label>
+      <label><input type="checkbox" id="gaze" checked> Gaze point</label>
+    </div>
+    <div class="toolbar range">
+      <label>From (s) <input id="from" type="number" min="0" step="0.1" value="0"></label>
+      <button id="markIn" class="secondary">Set start here</button>
+      <label>To (s) <input id="to" type="number" min="0" step="0.1" value="0"></label>
+      <button id="markOut" class="secondary">Set end here</button>
+      <button id="review">Review range</button>
+    </div>
+    <details><summary>Review settings</summary><div class="toolbar">
+      <label>Fixation spread (px) <input id="dispersion" type="number" min="5" max="500" value="45"></label>
+      <label>Heatmap radius (px) <input id="radius" type="number" min="5" max="500" value="55"></label>
+      <span class="small">Minimum fixation: 120 ms. Radius controls drawing softness, not measured accuracy.</span>
+    </div></details>
+    <p class="small" id="legend">White: estimated gaze · teal: connections between measured points · magenta: possible one-frame glitch. Connections do not reconstruct unseen eye motion.</p>
+    <div class="toolbar"><button id="addArea" class="secondary">Mark an area</button><button id="clearAreas" class="secondary">Clear areas</button><button id="export" class="secondary">Export review JSON</button><a id="tracking" hidden download="tracking.json">Coordinates JSON</a></div>
+    <div id="areas"></div>
     <div class="stats" id="stats"></div>
-    <p class="small">Colored gaze positions are estimates from the single eye camera. Gaps mean the pupil was not tracked confidently. The recording includes the visible cursor; the cursor coordinates are also saved separately.</p>
+    <p class="small">Heat shows estimated fixation time within the selected range; warmer means longer. Area dwell counts fixation centers inside each box. It does not prove a message was read or understood. Boxes follow screen coordinates, not scrolling content or objects in a video—select a short, stable scene. The original recording may already contain the live eye cursor.</p>
   </section>
 </main>
-<script>
-const $ = id => document.getElementById(id);
-let selected = null, data = null, active = null, lastDraw = 0;
-async function api(path, options) {
-  const response = await fetch(path, options);
-  const payload = await response.json();
-  if (!response.ok) throw Error(payload.error || `HTTP ${response.status}`);
-  return payload;
-}
-function notice(text) { $('message').textContent = text; }
-function showStatus(status) {
-  active = status.active;
-  $('start').disabled = !!active;
-  $('stop').disabled = !active;
-  if (active) notice(`Recording ${active}. Stop to finalize the video.`);
-}
-async function refreshDisplays() {
-  try {
-    const [list, config] = await Promise.all([api('/api/displays'), api('/api/config')]);
-    $('display').replaceChildren(...list.map((item, index) => {
-      const option = document.createElement('option');
-      option.value = item.id;
-      option.textContent = `Display ${item.id} · ${item.width}×${item.height} · position ${item.x}, ${item.y}`;
-      if (item.id === config.default_display_id || !config.default_display_id && index === 0) option.selected = true;
-      return option;
-    }));
-  } catch (error) { notice(error.message); }
-}
-async function refreshSessions() {
-  const list = await api('/api/sessions');
-  $('sessions').replaceChildren(...list.map(item => {
-    const button = document.createElement('button');
-    button.className = `session ${selected === item.id ? 'active' : ''}`;
-    button.innerHTML = `${new Date(item.created_at).toLocaleString()}<span>${item.status} · display ${item.display.id} · ${item.gaze_samples ?? 0} gaze samples</span>`;
-    button.onclick = () => loadSession(item.id);
-    return button;
-  }));
-}
-async function loadSession(id) {
-  selected = id;
-  data = await api(`/api/sessions/${id}/data`);
-  $('title').textContent = `Session ${new Date(data.manifest.created_at).toLocaleString()}`;
-  $('video').src = `/api/sessions/${id}/video`;
-  $('tracking').href = `/api/sessions/${id}/tracking`;
-  $('tracking').hidden = false;
-  const valid = data.gaze.filter(item => item.valid).length;
-  $('stats').replaceChildren(...[
-    `Duration ${(data.manifest.duration_ms / 1000 || 0).toFixed(1)} s`,
-    `${data.manifest.screen_frames ?? data.frames.length} screen frames`, `${valid}/${data.gaze.length} valid gaze samples`,
-    `Display ${data.manifest.display.id}`].map(text => {
-      const span = document.createElement('span'); span.textContent = text; return span;
-    }));
-  refreshSessions(); draw();
-}
-function nearest(items, ms) {
-  if (!items?.length) return null;
-  let low = 0, high = items.length - 1;
-  while (low < high) { const mid = (low + high) >> 1; if (items[mid].t_ms < ms) low = mid + 1; else high = mid; }
-  return low && Math.abs(items[low-1].t_ms - ms) < Math.abs(items[low].t_ms - ms) ? items[low-1] : items[low];
-}
-function draw() {
-  const video = $('video'), canvas = $('overlay');
-  const w = video.videoWidth || 1280, h = video.videoHeight || 720;
-  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
-  const ctx = canvas.getContext('2d'); ctx.clearRect(0, 0, w, h);
-  if (!data) return;
-  const ms = video.currentTime * 1000;
-  if ($('heatmap').checked) {
-    const samples = data.gaze.filter(item => item.valid && item.t_ms <= ms);
-    const stride = Math.max(1, Math.ceil(samples.length / 1500));
-    for (let i = 0; i < samples.length; i += stride) {
-      const item = samples[i], x = item.x * w, y = item.y * h, radius = Math.min(w, h) * .075;
-      const gradient = ctx.createRadialGradient(x, y, 0, x, y, radius);
-      gradient.addColorStop(0, 'rgba(255,65,30,.11)'); gradient.addColorStop(1, 'rgba(255,65,30,0)');
-      ctx.fillStyle = gradient; ctx.fillRect(x-radius, y-radius, radius*2, radius*2);
-    }
-  }
-  const gaze = nearest(data.gaze, ms);
-  if ($('gaze').checked && gaze?.valid && Math.abs(gaze.t_ms-ms) < 180) {
-    const x = gaze.x * w, y = gaze.y * h;
-    ctx.beginPath(); ctx.arc(x, y, 18, 0, Math.PI*2); ctx.fillStyle = '#eaff66b3'; ctx.fill();
-    ctx.lineWidth = 3; ctx.strokeStyle = '#1b2024'; ctx.stroke();
-  }
-  const frame = nearest(data.frames, ms);
-  if ($('cursor').checked && frame?.cursor_on_display && Math.abs(frame.t_ms-ms) < 250) {
-    const x = frame.cursor_nx*w, y = frame.cursor_ny*h;
-    ctx.beginPath(); ctx.moveTo(x-12,y); ctx.lineTo(x+12,y); ctx.moveTo(x,y-12); ctx.lineTo(x,y+12);
-    ctx.lineWidth = 3; ctx.strokeStyle = '#59d7ff'; ctx.stroke();
-  }
-}
-$('start').onclick = async () => {
-  notice('Starting screen capture…'); $('start').disabled = true;
-  try { const session = await api('/api/start', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({display_id:Number($('display').value)})});
-    showStatus({active:session.id}); await refreshSessions();
-  } catch (error) { notice(error.message); $('start').disabled = false; }
-};
-$('stop').onclick = async () => {
-  $('stop').disabled = true; notice('Finalizing video…');
-  try { const session = await api('/api/stop', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
-    showStatus({active:null}); notice(session.error || 'Recording saved.'); await refreshSessions(); await loadSession(session.id);
-  } catch (error) { notice(error.message); $('stop').disabled = false; }
-};
-$('video').addEventListener('timeupdate', draw);
-$('video').addEventListener('seeked', draw);
-$('video').addEventListener('loadedmetadata', draw);
-['heatmap','cursor','gaze'].forEach(id => $(id).addEventListener('change', draw));
-Promise.all([refreshDisplays(), refreshSessions(), api('/api/status').then(showStatus)]).catch(error => notice(error.message));
-setInterval(() => { if (active) refreshSessions().catch(() => {}); }, 4000);
-</script>
+<script src="/review.js"></script>
 </html>

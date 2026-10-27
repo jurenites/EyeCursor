@@ -36,6 +36,76 @@ class EyeCameraTests(unittest.TestCase):
     def publish(self, eye, frame=None):
         self.rig._publish(eye, self.rig.config[eye], self.frame if frame is None else frame, self.now)
 
+    def test_fixed_sphere_preserves_live_model_frames_and_calibration(self):
+        calibration = Calibration('Left eye camera')
+        calibration.eye_cameras = self.rig
+        calibration.matrix = np.eye(3)
+        detector = independent_detector()
+        detector.prev_model_center_avg = (310, 230)
+        detector.max_observed_distance = 42
+        detector.ray_lines = ['existing ray']
+        calibration.eye_model.start()
+        self.publish('left')
+        sample = self.rig.snapshot('left')
+        revision = dict(self.rig.revisions)
+        self.rig.set_fixed_eye_sphere('left', True)
+        self.rig.apply_eye_sphere_setting('left', detector, calibration.eye_model)
+        self.assertFalse(detector.eye_sphere_adjustment_enabled)
+        self.assertEqual(detector.prev_model_center_avg, (310, 230))
+        self.assertEqual(detector.max_observed_distance, 42)
+        self.assertEqual(detector.ray_lines, ['existing ray'])
+        self.assertEqual(self.rig.revisions, revision)
+        self.assertEqual(self.rig.snapshot('left')['serial'], sample['serial'])
+        self.assertIsNotNone(calibration.matrix)
+        self.assertEqual(calibration.eye_model.phase, 'collecting', 'A manual hold is not proof of readiness')
+        calibration.eye_model.phase = 'ready'
+        self.rig.set_fixed_eye_sphere('left', False)
+        self.rig.apply_eye_sphere_setting('left', detector, calibration.eye_model)
+        self.assertTrue(detector.eye_sphere_adjustment_enabled, 'Manual automatic mode must override readiness freezing')
+        self.assertFalse(self.rig.status()['eyes']['left']['fixed_eye_sphere'])
+        self.assertNotIn('fixed_eye_sphere', self.rig.config['right'])
+
+    def test_fixed_sphere_persists_and_legacy_camera_updates_keep_preference(self):
+        self.rig.set_fixed_eye_sphere('left', True)
+        self.rig.set_fixed_eye_sphere('right', False)
+        self.rig.configure(self.config)
+        restored = EyeCameraRig(lambda: self.devices, self.rig.path)
+        self.assertTrue(restored.config['left']['fixed_eye_sphere'])
+        self.assertFalse(restored.config['right']['fixed_eye_sphere'])
+        for invalid in (None, 0, 1, 'false', []):
+            with self.assertRaises(ValueError):
+                self.rig.set_fixed_eye_sphere('left', invalid)
+            config = copy.deepcopy(self.config)
+            config['left']['fixed_eye_sphere'] = invalid
+            with self.assertRaises(ValueError):
+                self.rig.configure(config)
+        with self.assertRaises(ValueError):
+            self.rig.set_fixed_eye_sphere('both', True)
+        self.assertEqual(self.rig.config, restored.config)
+
+    def test_companion_fixed_sphere_toggle_does_not_reset_its_estimate(self):
+        calibration = Calibration('Left eye camera')
+        calibration.eye_cameras = self.rig
+        detector = Mock()
+        detector.get_last_tracking_result.return_value = None
+        worker = CompanionEyeTracker(calibration, lambda frame, result, **kwargs: frame, detector)
+        self.publish('right')
+        worker.process_next()
+        self.assertTrue(detector.eye_sphere_adjustment_enabled)
+        self.rig.set_fixed_eye_sphere('right', True)
+        self.now += .04
+        self.publish('right')
+        worker.process_next()
+        self.assertFalse(detector.eye_sphere_adjustment_enabled)
+        worker.eye_model.phase = 'ready'
+        self.rig.set_fixed_eye_sphere('right', False)
+        self.now += .04
+        self.publish('right')
+        worker.process_next()
+        self.assertTrue(detector.eye_sphere_adjustment_enabled)
+        self.assertEqual(detector.process_frame.call_count, 3, 'Pupil detection continues in both modes')
+        detector.reset_tracking_state.assert_called_once()
+
     def test_numeric_pair_history_survives_hold_but_rejects_stale_or_reassigned_samples(self):
         for side in ('left','right'):
             self.publish(side)
@@ -201,6 +271,13 @@ class EyeCameraTests(unittest.TestCase):
         status, data = request('/diagnostics/left.jpg')
         self.assertEqual(status, 200)
         self.assertTrue(data.startswith(b'\xff\xd8'))
+        status, data = request('/eye-sphere', {'eye': 'left', 'fixed_eye_sphere': True})
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(data)['eye_cameras']['eyes']['left']['fixed_eye_sphere'])
+        self.assertEqual(request('/eye-sphere', {'eye': 'left', 'fixed_eye_sphere': 'true'})[0], 400)
+        self.assertEqual(request('/eye-sphere', {'eye': 'both', 'fixed_eye_sphere': True})[0], 400)
+        calibration.eye_cameras = None
+        self.assertEqual(request('/eye-sphere', {'eye': 'left', 'fixed_eye_sphere': True})[0], 400)
 
     def test_both_streams_capture_independently_and_release(self):
         captures = []
