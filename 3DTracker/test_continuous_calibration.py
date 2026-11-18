@@ -18,6 +18,46 @@ class ImmediateExecutor:
 
 
 class ContinuousTests(unittest.TestCase):
+    def test_single_pass_reserves_later_measurements_of_every_motion(self):
+        from continuous_calibration import check_recorded_head_movement,fit_head_candidate
+        base,fit,seeds=fixture()
+        rows=[]
+        for t in np.arange(0,32,.05):
+            head=moving_head(t)
+            rows.append((100+t,physical_eye([.5,.5],head),head,np.array([.5,.5])))
+        with patch('continuous_calibration.fit_head_candidate',wraps=fit_head_candidate) as fitter:
+            run=check_recorded_head_movement(base,fit,seeds,rows,ASPECT,16/9,'right',100,single_pass=True)
+        train=fitter.call_args.args[3]
+        self.assertTrue(all((r[0]-100)%8<3.5 for r in train))
+        self.assertEqual({int((r[0]-100)//8) for r in train},{0,1,2,3})
+        self.assertEqual(run.fit_metrics['validation_protocol'],'within_motion_held_out_blocks')
+        self.assertGreater(run.validation_diagnostics['samples'],200)
+        self.assertEqual(run.paused_elapsed,32)
+        self.assertTrue(run.applied,run.check_rejection_reasons)
+        # Wrong labels in the held-out windows cannot be filtered into success.
+        bad=[]
+        for stamp,eye,head,target in rows:
+            if 4.25<=(stamp-100)%8<7.75:eye=physical_eye([.9,.1],head)
+            bad.append((stamp,eye,head,target))
+        rejected=check_recorded_head_movement(base,fit,seeds,bad,ASPECT,16/9,'right',100,single_pass=True)
+        self.assertFalse(rejected.applied)
+
+    def test_low_fps_fits_after_fresh_frame_without_training_on_check_frames(self):
+        run=self.make_run()
+        # Polling just before each 3 FPS observation used to see a stale previous
+        # sample and defer the next attempt past the freshly arriving sample.
+        with patch('continuous_calibration.fit_head_candidate',side_effect=ValueError('fixture fit')) as fitter:
+            for t in np.arange(.1,24,.34):
+                head=moving_head(t)
+                run.tick(100+t)
+                run.observe((physical_eye([.5,.5],head),head),100+t,100+t)
+                if fitter.called:break
+        self.assertTrue(fitter.called,'Fresh low-FPS measurements must be allowed to start the solver')
+        fitted=fitter.call_args.args[3]
+        self.assertGreaterEqual(len(fitted),run.MIN_SAMPLES)
+        self.assertAlmostEqual(fitted[-1][0],100+t)
+        self.assertEqual(run.validation,[])
+
     def make_run(self):
         base,fit,seeds=fixture()
         run=ContinuousTargetCalibration(base,fit,seeds,ASPECT,16/9,100,executor=ImmediateExecutor())
@@ -29,6 +69,24 @@ class ContinuousTests(unittest.TestCase):
             head=moving_head(t)
             target=[.85,.2] if away and run.phase=='validate' else [.5,.5]
             run.observe((physical_eye(target,head),head),100+t,100+t)
+
+    def test_recorded_two_cycle_fit_keeps_check_frames_out_of_training(self):
+        from continuous_calibration import check_recorded_head_movement,fit_head_candidate
+        base,fit,seeds=fixture()
+        for looking_away in (False,True):
+            rows=[]
+            for t in np.arange(0,64,.1):
+                head=moving_head(t)
+                target=[.9,.15] if looking_away and t>=32 else [.5,.5]
+                rows.append((100+t,physical_eye(target,head),head,np.array([.5,.5])))
+            with patch('continuous_calibration.fit_head_candidate',wraps=fit_head_candidate) as fitter:
+                run=check_recorded_head_movement(base,fit,seeds,rows,ASPECT,16/9,'right',100)
+                fitted=fitter.call_args.args[3]
+                self.assertTrue(all(row[0]<132 for row in fitted))
+                self.assertEqual(len(fitted),320)
+            self.assertEqual(run.applied,not looking_away,run.validation_diagnostics)
+            self.assertIsNotNone(run.paused_elapsed)
+            self.assertEqual(run.validation_diagnostics['samples'],320)
 
     def test_applies_only_after_future_check_and_continues_until_stopped(self):
         run=self.make_run();original=run.base_mapping
@@ -79,18 +137,19 @@ class ContinuousTests(unittest.TestCase):
 
     def test_guided_cues_share_shift_depth_nod_turn_clock_across_eyes(self):
         run=self.make_run();run.enable_guided(100)
-        self.assertEqual([run.motion_cue(t)['key'] for t in (100,104,108,112)],['shift','depth','pitch','yaw'])
+        self.assertEqual([run.motion_cue(t)['key'] for t in (100,108,116,124)],['shift','depth','pitch','yaw'])
+        self.assertEqual(run.motion_cue(107.99)['key'],'shift')
         other=self.make_run();other.enable_guided(100)
-        run.phase='validate';run.validation_started=117.3
-        other.phase='validate';other.validation_started=119.1
-        for t in np.arange(117,134,.1):
+        run.phase='validate';run.validation_started=133.3
+        other.phase='validate';other.validation_started=135.1
+        for t in np.arange(133,166,.1):
             self.assertEqual(run.motion_cue(t)['key'],other.motion_cue(t)['key'])
-        self.assertEqual(run.motion_cue(120)['key'],'depth')
-        self.assertTrue(run.motion_cue(120)['checking'])
+        self.assertEqual(run.motion_cue(140)['key'],'depth')
+        self.assertTrue(run.motion_cue(140)['checking'])
 
     def test_guided_check_does_not_claim_turn_compensation_without_turns(self):
         run=self.make_run();run.enable_guided(100)
-        for t in np.arange(.1,34,.1):
+        for t in np.arange(.1,66,.1):
             head=moving_head(t);head[0]=0.
             run.observe((physical_eye([.5,.5],head),head),100+t,100+t)
         self.assertFalse(run.applied)
@@ -99,10 +158,15 @@ class ContinuousTests(unittest.TestCase):
         self.assertFalse(turn['movement_observed'])
         self.assertFalse(turn['accepted'])
         self.assertGreater(len(run.samples),len(run.training_snapshot), 'Failed check evidence is retained')
+        run.pause(166)
+        report=run.state(166)
+        self.assertTrue(any(reason.startswith('yaw:') for reason in report['check_rejection_reasons']))
+        self.assertGreater(report['fitted_training_samples'],0)
+        self.assertGreater(report['evaluated_checking_samples'],0)
 
     def test_sideways_motion_cannot_count_as_checked_depth(self):
         run=self.make_run();run.enable_guided(100)
-        for t in np.arange(.1,34,.1):
+        for t in np.arange(.1,66,.1):
             head=moving_head(t);head[5]=run.head_fit.reference[5]
             run.observe((physical_eye([.5,.5],head),head),100+t,100+t)
         self.assertFalse(run.applied)

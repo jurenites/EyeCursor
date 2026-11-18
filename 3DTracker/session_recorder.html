@@ -2,7 +2,7 @@
 <html lang="en">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>EyeCursor sessions</title>
+<title>EyeCursor recording</title>
 <style>
   :root { font: 15px/1.45 -apple-system, BlinkMacSystemFont, sans-serif; color: #eaf4ff; background: #0b1321; }
   * { box-sizing: border-box; }
@@ -43,23 +43,50 @@
   #screen.selecting canvas { pointer-events:auto; cursor:crosshair; }
   .stats { display: flex; flex-wrap: wrap; gap: 9px; }
   .stats span { border: 1px solid #435c76; border-radius: 8px; padding: 6px 9px; background: #15263a; }
+  [hidden] { display: none !important; }
+  #cameraGrid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; }
+  .camera { background:#101b2d; border:1px solid #33465f; border-radius:10px; overflow:hidden; }
+  .camera h3 { margin:10px 12px 4px; font-size:15px; }
+  .camera .image { aspect-ratio:4/3; background:#050a12; position:relative; }
+  .camera img { width:100%;height:100%;object-fit:contain; }
+  .camera .missing { position:absolute;inset:0;display:grid;place-items:center;color:#aebed1; }
+  .camera .timing { margin:6px 12px; font:11px/1.5 ui-monospace,monospace; min-height:34px; }
+  .camera pre { margin:8px 12px; font:11px/1.6 ui-monospace,monospace; white-space:pre-wrap; overflow-wrap:anywhere; }
+  .camera details { margin:8px 12px; font-size:12px; }
+  .camera details pre { margin:8px 0; max-height:260px; overflow:auto; }
+  #screen.seeking video, #screen.seeking canvas { visibility:hidden; }
+  #screen.seeking::after { content:'Seeking screen frame…';position:absolute;inset:0;display:grid;place-items:center;color:#aebed1; }
+  .playback { gap:8px; }
+  #timeline { width:100%;accent-color:#78bdf5; }
+  #playTime { font:14px ui-monospace,monospace; min-width:110px; }
   @media(max-width:800px) { main { display:block; } aside { border-right:0; border-bottom:1px solid #33465f; } }
 </style>
-<header><h1>EyeCursor sessions</h1><a href="http://127.0.0.1:8765/">Open eye calibration</a><span class="small">Local files only</span></header>
+<header><h1>Recording & replay</h1><span class="small">Local files only</span></header>
 <main>
   <aside>
-    <h2>Record this display</h2>
-    <p>Finish calibration, then choose a monitor. Recording starts only when you press Start. Keep EyeCursor open until you stop recording.</p>
-    <label>Display<select id="display"></select></label>
+    <h2>Record diagnostics</h2>
+    <p>Capture both eyes, the face camera, and their measurements for up to one minute. No calibration needed. Each new recording replaces the previous one.</p>
+    <label><input type="checkbox" id="includeScreen"> Also record a monitor</label>
+    <label id="displayChoice" hidden>Display<select id="display"></select></label>
     <div class="buttons"><button id="start">Start recording</button><button id="stop" class="secondary" disabled>Stop</button></div>
     <div id="message" role="status"></div>
-    <h2>Saved sessions</h2>
+    <h2>Latest recording</h2>
     <div id="sessions"></div>
   </aside>
   <section id="viewer">
-    <h2 id="title">Choose a session</h2>
-    <div id="screen"><video id="video" controls playsinline preload="metadata"></video><canvas id="overlay"></canvas></div>
-    <div class="toolbar">
+    <h2 id="title">Record a session to replay</h2>
+    <div id="diagnosticReplay" hidden>
+      <div class="toolbar"><label><input type="checkbox" id="overlays" checked> Detection overlays</label><button id="moment" class="secondary">Export this moment</button><a id="allLogs" download>All measurements</a><a id="cameraArchive" download>Camera images</a></div>
+      <div id="cameraGrid"></div>
+      <p class="small" id="captureInfo"></p>
+    </div>
+    <div class="toolbar playback">
+      <button id="play" disabled>Play</button><button id="previousFrame" class="secondary" disabled aria-label="Previous camera frame">◀ Frame</button><button id="nextFrame" class="secondary" disabled aria-label="Next camera frame">Frame ▶</button>
+      <output id="playTime">00:00.000</output><label>Go to (s) <input id="seekTime" type="number" min="0" step="0.001" value="0"></label>
+      <input id="timeline" aria-label="Recording timeline" type="range" min="0" max="60000" step="1" value="0" disabled>
+    </div>
+    <div id="screen" hidden><video id="video" playsinline preload="metadata"></video><canvas id="overlay"></canvas></div>
+    <div id="gazeReview" hidden><div class="toolbar">
       <label><input type="checkbox" id="trail" checked> Measured path</label>
       <label><input type="checkbox" id="heatmap"> Dwell heatmap</label>
       <label><input type="checkbox" id="raw"> Include flagged points</label>
@@ -83,7 +110,9 @@
     <div id="areas"></div>
     <div class="stats" id="stats"></div>
     <p class="small">Heat shows estimated fixation time within the selected range; warmer means longer. Area dwell counts fixation centers inside each box. It does not prove a message was read or understood. Boxes follow screen coordinates, not scrolling content or objects in a video—select a short, stable scene. The original recording may already contain the live eye cursor.</p>
+    </div>
   </section>
 </main>
 <script src="/review.js"></script>
+<script src="/diagnostics.js"></script>
 </html>

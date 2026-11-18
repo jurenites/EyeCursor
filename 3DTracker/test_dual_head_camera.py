@@ -36,12 +36,42 @@ def trained(noisy=False):
 
 
 class AlignmentTests(unittest.TestCase):
+    def test_guided_alignment_checks_a_whole_later_motion_cycle(self):
+        model=ViewAlignment();model.begin()
+        for t in np.arange(100,164,.05):
+            local=(t-100)%32
+            axis=int(local//8)
+            s=BASE.copy();s[axis]+=.7*SCALE[axis]*np.sin(local%8*np.pi/4)
+            p=s.copy();p[0]+=.1*SCALE[0]
+            model.add(packet(p,t),packet(s,t))
+        model.finish(split_time=132,started_at=100)
+        self.assertIsNotNone(model.model)
+        self.assertLess(model.validation_error,.01)
+        # A later repeat cannot silently disappear from evaluation.
+        model.model=None
+        model.rows=type(model.rows)((r for r in model.rows if not 148<=r[0]<156),maxlen=6000)
+        with self.assertRaisesRegex(ValueError,'movement interval'):model.finish(split_time=132,started_at=100)
+        self.assertIsNone(model.model)
+
     def test_maps_held_out_oblique_view_to_primary_frame(self):
         model = trained()
         predicted = model.predict(BASE)
         np.testing.assert_allclose(predicted, BASE+np.array([.2,-.3,.1,.5,-.4,.3])*SCALE, atol=.0002)
         self.assertLess(model.validation_error, .01)
         self.assertIsNone(model.predict(BASE+10*SCALE))
+
+    def test_saved_exposure_reprojects_like_live_without_altering_alignment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rig=DualHeadCamera(HeadCamera(lambda:[]),lambda:[],Path(tmp)/'head.json')
+            rig.alignment=trained()
+            truth=rig.alignment.predict(BASE)
+            primary=packet(truth+.2*SCALE,10)
+            secondary=packet(BASE,10)
+            saved=dict(primary,primary_features=primary['features'],secondary_sample=secondary,paired_primary_sample=primary)
+            result=rig.reproject_sample(saved)
+            np.testing.assert_allclose(result['features'],truth+.15*SCALE)
+            self.assertEqual(saved['features'],primary['features'])
+            self.assertFalse(rig.alignment.bad_keys)
 
     def test_static_and_unrelated_views_cannot_enable_assistance(self):
         for random_primary in (False, True):
@@ -173,6 +203,16 @@ class RigTests(unittest.TestCase):
         output = self.rig.sample_at(10.06)
         self.assertGreater(output['epoch'], epoch)
         self.assertIsNone(self.rig.alignment.model)
+
+    def test_unused_secondary_reconnect_preserves_primary_gaze_epoch(self):
+        self.rig.configure('table');self.rig._check_session()
+        epoch=self.rig.epoch
+        self.rig.learn()
+        self.assertEqual(self.rig.epoch,epoch)
+        self.secondary.epoch+=1
+        self.rig._check_session()
+        self.assertEqual(self.rig.epoch,epoch)
+        self.assertFalse(self.rig.alignment.collecting)
 
     def test_api_rejects_changes_during_calibration_and_clears_maps_when_idle(self):
         calibration = Calibration('test')

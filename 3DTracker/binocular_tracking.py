@@ -51,11 +51,13 @@ class CompanionEyeTracker:
         self.detector.pupil_confidence_threshold = threshold
         self.detector.pupil_confidence_threshold_sphere = threshold
         self.eye_model.threshold = threshold
-        self.rig.apply_eye_sphere_setting(eye, self.detector, self.eye_model)
+        flow=self.calibration.onboarding
+        scanning=bool(getattr(flow,'hybrid',False) and flow.phase=='fitting')
+        self.rig.apply_eye_sphere_setting(eye, self.detector, self.eye_model, force_collecting=scanning)
         self.detector.process_frame(sample['frame'], timestamp=sample['time'])
         result = self.detector.get_last_tracking_result()
         self.eye_model.observe(result, sample['time'])
-        if self.eye_model.status(sample['time'])['can_freeze']:
+        if not scanning and self.eye_model.status(sample['time'])['can_freeze']:
             self.eye_model.freeze(sample['time'])
         if result is not None and self.calibration.head_camera is not None:
             result['head_pose'] = self.calibration.head_camera.sample_at(sample['time'])

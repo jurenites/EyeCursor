@@ -154,22 +154,28 @@ The small target appears above normal application windows on the **built-in lapt
 display**, even if another monitor is set as the primary display. It does not take
 keyboard focus or intercept clicks.
 
-One press runs two learning stages automatically:
+With the laptop webcam, one press runs these stages automatically:
 
-1. **Five dots.** Keep your head comfortably still and follow the center, then
-   four corners. The center needs about one second of usable paired IR/webcam
-   data. Each corner travels for 0.55 seconds, settles for 0.2 seconds, and captures
-   for 1.2 seconds. Usable anchors establish the initial approximate screen map.
-2. **Head movement.** The target moves smoothly back to the center. Keep watching
-   it while following Slide sideways, Closer / farther, Nod and Turn cues beside
-   that same target. Each cue lasts four seconds on a shared repeating timeline
-   for both eyes. Collection and independent checking each cover a full cycle.
-   The stage budget is 36 seconds, with up to sixteen extra seconds only to
-   finish an already-started check. All four motion checks must pass before an
-   early completion (after at least 33 seconds). Measurements come directly from paired camera
-   frames, without mouse movement or a separate Start action. Only validated
-   corrections are applied. If none qualifies, the five-dot fit is retained and
-   the final result says so; reaching the time limit does not claim a good fit.
+1. **Left preview reference.** Look at your left pupil in its live IR preview.
+   The marker freezes at that screen location; gently align your head, then hold.
+2. **Right preview reference.** Repeat for the right eye. Each preview takes
+   six seconds with enough fresh paired observations, including a two-second
+   settling interval. A missing pupil pauses this step for retry after fifteen
+   seconds. The camera/display geometry is not assumed to be collinear: these
+   are explicit known-target references, journaled separately for each eye and
+   included in its later head-model anchors. The marker never chases the pupil.
+3. **Five dots.** Keep your head comfortably still and follow the center, then
+   four corners. Both eyes collect independently during this same five-dot pass.
+4. **Head movement.** Watch the fixed center through Slide sideways, Closer /
+   farther, Nod and Turn: eight seconds each, one 32-second pass. The fit uses
+   the first 3.5 seconds of each motion; 4.25–7.75 seconds are held out for
+   checking, with a gap between them. No repeated cycle is required. Fitting
+   runs in the background after capture, and only checked corrections apply.
+   A failed fit keeps the existing screen map and reports that outcome.
+
+Legacy API clients retain the earlier capture protocol. Optional second-webcam
+alignment retains its separate two-cycle alignment/checking capture.
+
 The desktop cursor resumes after the head stage. There is no automatic second
 round of screen targets. Press **Check Accuracy** only when you want to measure
 the resulting error. Its five new dots
@@ -186,7 +192,7 @@ The panel has **Start/Restart calibration** and **Learn at cursor**.
 The duplicate standalone head-learning and dot-learning buttons are removed from
 normal controls. Their endpoints remain available for saved sessions and diagnostic
 replay, but are not extra required setup modes. A legacy head session already in
-progress retains a Finish action. **Align with IR preview** stays removed.
+progress retains a Finish action. The separate **Align with IR preview** button stays removed; preview references are now part of Start calibration.
 
 Choose **Learn at cursor** to refine the initial map. Move the pointer,
 then deliberately look at it for about one second until the ring completes.
@@ -264,6 +270,27 @@ reported as reduced drift requiring further refinement, not accurate calibration
 This deliberately permits checked partial improvements that the former all-or-nothing
 0.06 limit discarded. Center checks alone do not validate the entire screen.
 Both eyes can fit and validate their own head correction during the same capture.
+
+`replay_head_motion.py <events.jsonl> --recorded` reconstructs both independent
+eye maps and replays the guided head recording using original laptop-webcam
+features. It emits per-frame checking traces, screen-point errors, model-selection
+metrics and specific failed movements. The first 32 seconds train; the later 32
+seconds only check. New audits store the exact movement clock. Older audits infer
+it from the first paired exposure and report `clock_exact: false`; near-threshold
+decisions from those recordings are timing-sensitive. This is retrospective
+debugging, not a fresh accuracy claim, and it never changes the running app.
+
+The empirical fallback selects linear, quadratic or linear-plus-local Gaussian
+head-displacement models using four blocked folds within the training recording.
+Each fold holds out two-second stretches across the movement sequence, rather
+than holding out only its final turn. Selection uses screen error through the
+five-dot map, not equally weighted IR X/Y error. Prediction subtracts the learned
+pupil displacement for the current head pose before applying the screen map:
+`screen = reference_map(raw_pupil - previous_head_correction - displacement(head))`.
+For the local model, displacement is a linear term plus weighted Gaussian
+distances to recorded head poses. This preserves response to new eye movements;
+it does not replace the output with the known center target. Existing support,
+independent-check, per-motion and error-tail acceptance limits still apply.
 
 `replay_head_motion.py <events.jsonl> --eye-side left` replays a saved five-anchor,
 steady-head session without changing the running app. Its chronological fitting
@@ -617,8 +644,9 @@ after changing the camera mounting or restarting the application.
 
 ### Recording gaze paths and dwell
 
-Choose **Record & replay…** in the EyeCursor menu. This opens the local recording
-page; it does not start capture. After calibration, select the display and press
+For retrospective screen-content analysis, open the optional local browser
+review at localhost:8766 after opening diagnostics in EyeCursor. Enable
+**Also record a monitor**, select the display and press
 **Start recording**, then **Stop** before quitting EyeCursor. Screen capture uses
 macOS Screen Recording permission. Recordings stay under `recordings/` in the
 project. The page can also run with `.venv/bin/python 3DTracker/session_recorder.py`.
@@ -660,3 +688,141 @@ fixations. They are not attached to moving content: for scrolling pages, scene
 cuts or video, select short stable intervals. No semantic text/object recognition,
 reading/comprehension inference, or gaze-to-content registration is performed.
 Looking near a paragraph does not establish that the entire paragraph was read.
+
+The head-motion guide sits immediately below the unchanged fixation circle.
+Nodding uses a round rear-view head, an ear-to-ear axle and a curved vertical
+arrow. Turning uses a horizontal curved arrow; translations use straight arrows.
+
+### Synchronized pupil diagnostic recording
+
+Recording controls are pinned to the bottom of the diagnostics camera sidebar:
+red circle **Record**, **Play/Pause**, **Stop**, previous/next camera frame, and a
+shared timeline. The menu's **Record & replay…** action opens this same window.
+There is no separate replay window. Native recording captures both IR eyes,
+the primary face webcam, full tracker state and displayed cursor positions.
+Calibration is not required; replay is available after an active calibration ends.
+
+While recording, Pause freezes capture; Play resumes on the same timeline,
+excluding paused time. Stop saves, and capture automatically ends after 60 seconds
+of active recording. Only the latest session is retained; a successful new start
+replaces it, while a failed start preserves it. Closing diagnostics does not stop
+capture; quitting EyeCursor finalizes it.
+
+During replay, the existing camera previews, numeric diagnostics, 3D scene and
+red/orange/white desktop markers use the selected recorded time. Desktop marker
+positions and opacity come from native presentation samples, without rerunning
+calibration, applying smoothing again, moving the system cursor or generating
+clicks. The marker positions use the current desktop coordinate layout; keep the
+same monitor arrangement for spatial comparison. Each camera retains its actual
+capture time; gaps over 150 ms remain blank. Stop replay returns the same window
+to live tracking. The calibration and tracking controls cannot modify the live
+model from a replayed frame. New recordings include scene and presentation data;
+older clips can replay their camera images but cannot reconstruct missing scene
+state or desktop markers.
+
+The optional browser review service remains available at localhost:8766 for raw
+frame/log export and monitor-video capture; it is not opened by native controls.
+Its monitor-video mode cannot pause recording. For a report, give the time shown
+beside the sidebar timeline (for example `00:09.200`). These observations do not
+assert where the user was truly looking and never become calibration targets.
+
+Files remain under `recordings/<session-id>/`: `session.json`,
+`initial-state.json`, per-camera `left/right/face-frames.jsonl`,
+`camera-frames.zip`, `camera-summary.json`, `gaze.jsonl` (including tracker state),
+`presentation.jsonl` (displayed cursor positions, opacity and scene settings), and optional `screen.mp4`
+and `frames.jsonl`. Eye source frames use lossless PNG; face inference inputs and
+preview overlays use JPEG. Eye ellipse coordinates use the existing 640×480
+center-cropped/resized detector space, after configured camera rotation; the
+archived source dimensions are recorded separately. Full detector results,
+including rejection/hold evidence, are paired with their processed source frame.
+Face logs contain yaw/pitch/roll in radians, normalized image position and log
+face scale; the replay summary converts the three angles to degrees.
+
+Camera timestamps share the OS monotonic clock. Screen PTS is bridged to that
+clock at capture start. This is software alignment, not hardware synchronization;
+USB/driver acquisition latency remains unknown. Numeric state snapshots have
+observation timestamps as well as the underlying eye capture IDs. The recorder
+uses a bounded background queue and reports dropped frames instead of blocking
+tracking. It records processed camera frames, not every frame the USB device may
+have produced. Nothing is captured until Start is pressed.
+
+
+### Eye-model outlines
+
+The white ellipse is the current detected iris. The blue circle is an estimated
+projection of the eyeball model; it is drawn only after a stable, supported fit.
+Left and right cameras fit independently. Camera distance, focal length and crop
+can legitimately give different pixel radii, so the circles are not forced equal.
+
+The old radius was the largest observed distance from center to pupil edge,
+which measured gaze coverage rather than eyeball size. The live estimator now
+uses multiple pupil ellipses: `q = minor/major = cos(theta)` and
+`pupil-center distance = L sin(theta)`. A robust shared `L` and center must explain
+those observations; reliable iris rim sizes provide the enclosing model radius
+`R = sqrt(L² + iris_radius²)`. Outliers, insufficient directional variation,
+inconsistent scale, and missing iris evidence cannot initialize the model.
+The raw camera direction uses this same center and rotation scale, rather than
+the legacy demonstration's separately positioned virtual sphere. Screen maps
+still learn their coordinates from known calibration targets and pupil/head data.
+
+This is an orthographic circular-eye approximation in image pixels. Perspective,
+corneal refraction and imperfect contours can bias it; neither circle is a direct
+measurement of the physical eyeball. Diagnostic recordings retain the fit's
+method, sample count, residual, iris radius and rotation radius for review.
+
+
+### Target-free eye preparation
+
+Start calibration now begins with 12 seconds of comfortable eye circles while
+keeping the head still. The floating panel shows instructions and a countdown,
+with no fixation dot or orbiting target. Both IR estimators keep collecting during
+this preparation, including when a saved fixed-sphere preference is enabled.
+These observations have no known screen target and cannot train the screen map.
+The five-dot sequence starts automatically afterward with its full time budget,
+followed by the existing guided head-motion stage. Stop / Retry also works for
+this preparation. The timer reports preparation time, not model-fit success;
+unsupported eye geometry stays unavailable and can continue learning at the dots.
+
+### Guided setup with two face webcams
+
+**Start calibration** begins with five shared screen targets, head still. Each
+IR camera contributes its own fixation samples, including the raw paired webcam
+exposure. It then presents a fixed center target for one 64-second head movement
+recording: eight seconds each of shift, depth, nod, turn, then repeat. Both webcams
+and both eyes are measured together. There is no separate webcam-only warmup and
+no second head-movement exercise. Local spoken prompts announce stages and motion
+changes; **Spoken guidance** in Camera setup can disable them. Stale/replayed states
+do not queue speech. Calibration never starts automatically at app launch.
+
+The first movement cycle learns empirical webcam alignment; the second checks it.
+The saved five-dot head samples are then re-expressed using their original paired
+exposures through that same alignment, preserving the known screen targets and IR
+measurements. Both eye/head models are fitted independently on the first cycle,
+checked on the untouched second cycle, and applied only if the existing accuracy
+and motion-coverage gates pass. Fitting runs off the capture/UI thread. An
+independent screen accuracy check follows automatically. Stop / Retry preserves
+completed prerequisites. The single-webcam workflow retains its existing eye sweep.
+
+Webcam alignment remains empirical pose assistance, not metric stereo. It cannot
+establish camera intrinsics, physical baseline or guaranteed gaze accuracy.
+Looking at your pupil in a video establishes a screen fixation; it does not prove
+physical collinearity of eyeball center, camera lens and display. The app must not
+force an optical vector to zero or change eyeball geometry on that assumption.
+
+Alignment logs retain raw paired poses and validation errors. Explicit recordings
+include `face_secondary` beside both IR eyes and the laptop face stream on the
+same replay timeline. Generic USB choices show port identifiers; assignments are
+local settings rather than OS camera renames. Reassign eyes after USB IDs change.
+The standalone app selects a free loopback port if another service occupies 8765.
+
+### Eyeball outline and illustration pivot
+
+Each IR camera learns its own eyeball sphere. `Model pending` means that camera
+has not produced a supported fit; the app does not draw an invented sphere.
+A fitted blue outline remains visible during a brief rejected pupil, while a
+green gaze arrow still requires a usable current pupil and a ready model.
+
+The 3D head uses an ear-level local origin with schematic eye offsets. Projection
+accounts for the eyes being in front of the skull center, including during nods.
+This is an illustration with assumed dimensions, not a new metric head tracker.
+The webcam already estimates rotation from the full MediaPipe face mesh.

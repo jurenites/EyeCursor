@@ -3,6 +3,33 @@ import AppKit
 import ApplicationServices
 import AVFoundation
 import Carbon
+import Darwin
+
+// A different local service may own the preferred port (for example Docker).
+// Probe only loopback and pass the chosen port to the child tracker.
+func availableTrackerPort(preferred: UInt16 = 8765) -> Int {
+    let fd = socket(AF_INET, SOCK_STREAM, 0)
+    guard fd >= 0 else { return 0 }
+    defer { close(fd) }
+    var address = sockaddr_in()
+    address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    address.sin_family = sa_family_t(AF_INET)
+    address.sin_addr.s_addr = inet_addr("127.0.0.1")
+    func tryBind(_ port: UInt16) -> Bool {
+        address.sin_port = port.bigEndian
+        return withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
+            }
+        }
+    }
+    guard tryBind(preferred) || tryBind(0) else { return 0 }
+    var size = socklen_t(MemoryLayout<sockaddr_in>.size)
+    let result = withUnsafeMutablePointer(to: &address) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &size) }
+    }
+    return result == 0 ? Int(UInt16(bigEndian: address.sin_port)) : 0
+}
 
 struct CalibrationStep: Decodable {
     let phase: String
@@ -77,6 +104,9 @@ struct EyeCameraSlot: Decodable {
     var scene_direction: EyeCameraDirection? = nil
     var tracking_epoch: String? = nil
     var fixed_eye_sphere: Bool? = nil
+    var pupil_center: [Double]? = nil
+    var measurement_valid: Bool? = nil
+    var eyeball_model_status: String? = nil
 }
 struct EyeCamerasState: Decodable {
     let active_eye: String
@@ -178,8 +208,18 @@ struct AccuracyCheckState: Decodable {
     let remaining_seconds: Double
 }
 
+struct PreviewReferenceState: Decodable {
+    let eye: String?
+    let target: [Double]?
+    let completed: [String]
+}
+
 struct OnboardingState: Decodable {
+    var preview_alignment: PreviewReferenceState? = nil
+    let two_view_guided: Bool?
+    let eye_scan_enabled: Bool?
     let guided_head_outcome: String?
+    let second_view_fallback_reason: String?
     let dot_learning: DotLearningState?
     let eye_map_status: [String:String]?
     let accuracy_check: AccuracyCheckState?
@@ -228,14 +268,61 @@ struct EyeClick: Decodable {
     let age_ms: Double
 }
 
+final class CalibrationVoiceGuide {
+    private let synthesizer = AVSpeechSynthesizer()
+    var enabled = true
+    var output: ((String) -> Void)?
+    private var lastKey: String?
+    func silence(reset: Bool = true) { synthesizer.stopSpeaking(at: .immediate); if reset { lastKey = nil } }
+    static func instruction(_ flow: OnboardingState) -> (String,String)? {
+        let phase = flow.phase
+        let key = "\(flow.calibration_session_id ?? "")|\(phase)"
+        switch phase {
+        case "preview":
+            let eye=flow.preview_alignment?.eye ?? "left"
+            return (key+"|"+eye,"Look at your " + eye + " pupil in its camera preview. Gently align your head with the fixed marker, then hold still.")
+        case "head": return (key,"Keep your head still. Look at the center dot.")
+        case "screen":
+            let index = max(0,min(3,(flow.screen_target_index ?? 2)-2))
+            return (key + "|\(index)",["Top left.","Top right.","Bottom right.","Bottom left."][index])
+        case "fitting": return (key,"Keep your head still. Look around slowly in comfortable circles.")
+        case "views", "motion":
+            let cue = phase == "views" ? flow.head_cue : flow.cursor_calibration?.head_cue
+            guard let cue = cue else { return (key,"Look at the center dot.") }
+            let action = ["shift":"Slide your head gently left and right.","depth":"Move gently closer, then farther away.","pitch":"Gently nod your head up and down.","yaw":"Gently turn your head left and right."][cue] ?? "Move your head gently."
+            let checking = (flow.remaining_seconds ?? 64) <= 32
+            return (key + "|\(cue)|\(checking)","Keep watching the center. " + action)
+        case "views_fit": return (key,flow.two_view_guided == true ? "Movement recorded. Checking the measurements, then continuing to the check dots." : "Movement recorded. Checking the measurements.")
+        case "verify": return (key,"Keep your head still and follow the check dots.")
+        case "paused": return (key,"Calibration paused. Use Retry step in diagnostics to continue.")
+        case "complete": return (key,"Calibration finished. The results are in diagnostics.")
+        default: return nil
+        }
+    }
+    func update(_ flow: OnboardingState?) {
+        guard enabled,let flow = flow,let (key,text) = Self.instruction(flow) else { silence();return }
+        guard key != lastKey else { return }
+        // Do not queue old directions behind a new target or a Stop action.
+        synthesizer.stopSpeaking(at: .immediate);lastKey=key
+        if let output = output { output(text) }
+        else {
+            let utterance = AVSpeechUtterance(string:text)
+            utterance.voice = AVSpeechSynthesisVoice(language:"en-US")
+            utterance.rate = AVSpeechUtteranceDefaultSpeechRate
+            synthesizer.speak(utterance)
+        }
+    }
+}
+
 final class CalibrationStepsView: NSView {
     let heading = NSTextField(labelWithString: "Calibration")
+    let muteButton = NSButton(title: "Mute", target: nil, action: nil)
     let countdown = NSTextField(wrappingLabelWithString: "Waiting for cameras")
     let actionButton = NSButton(title: "Start calibration", target: nil, action: nil)
     let manualButton = NSButton(title: "Learn at cursor", target: nil, action: nil)
     let headButton = NSButton(title: "Calibrate head movement", target: nil, action: nil)
     let accuracyButton = NSButton(title: "Check Accuracy", target: nil, action: nil)
-    let rows = (0..<4).map { _ in NSTextField(wrappingLabelWithString: "") }
+    let rows = (0..<5).map { _ in NSTextField(wrappingLabelWithString: "") }
     let descriptions = ["Follow five dots; keep your head comfortably still",
                         "Watch the fixed center; gently turn and shift your head",
                         "Follow the check dots; accuracy is measured automatically"]
@@ -243,6 +330,10 @@ final class CalibrationStepsView: NSView {
     override init(frame: NSRect) {
         super.init(frame: frame)
         heading.font = .systemFont(ofSize: 13, weight: .semibold)
+        muteButton.bezelStyle = .rounded
+        muteButton.controlSize = .small
+        muteButton.imagePosition = .imageLeading
+        addSubview(muteButton)
         countdown.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
         countdown.textColor = .secondaryLabelColor
         countdown.alignment = .left
@@ -264,7 +355,9 @@ final class CalibrationStepsView: NSView {
     }
     override func layout() {
         super.layout()
-        heading.frame = NSRect(x: 0, y: bounds.height - 20, width: bounds.width, height: 20)
+        heading.frame = NSRect(x: 0, y: bounds.height - 20, width: max(0, bounds.width - 92), height: 20)
+        heading.lineBreakMode = .byTruncatingTail
+        muteButton.frame = NSRect(x: max(0, bounds.width - 86), y: bounds.height - 24, width: 86, height: 24)
         countdown.frame = NSRect(x: 0, y: bounds.height - 90, width: bounds.width, height: 64)
         headButton.frame = NSRect(x: 0, y: bounds.height - 126, width: bounds.width, height: 30)
         let footer: CGFloat = accuracyButton.isHidden ? 0 : 36
@@ -280,8 +373,13 @@ final class CalibrationStepsView: NSView {
         manualButton.isHidden = flow?.cursor_calibration?.active == true || phase == "complete"
         let paused = phase == "paused"
         let stage = paused ? (flow?.stopped_stage ?? "") : phase
-        let current: Int? = ["waiting","fitting","head","screen"].contains(stage) ? 0 : stage == "motion" ? 1 : stage == "verify" ? 2 : nil
-        let running = ["waiting", "fitting", "head", "screen", "motion", "verify", "refine"].contains(phase)
+        let scan = flow?.eye_scan_enabled == true
+        let views = flow?.two_view_guided == true
+        let previews = flow?.preview_alignment != nil
+        let offset = previews ? 2 : scan ? 1 : 0
+        let descriptions = (previews ? ["Look at the left pupil preview; align and hold", "Look at the right pupil preview; align and hold"] : scan ? ["Look around slowly in circles; keep your head still"] : []) + self.descriptions
+        let current: Int? = stage == "preview" ? (flow?.preview_alignment?.eye == "right" ? 1 : 0) : ["waiting","fitting"].contains(stage) ? 0 : ["head","screen"].contains(stage) ? offset : ["views","views_fit","motion"].contains(stage) ? 1 + offset : stage == "verify" ? 2 + offset : nil
+        let running = ["preview", "views_fit", "views", "waiting", "fitting", "head", "screen", "motion", "verify", "refine"].contains(phase)
         manualButton.isHidden = running || flow?.cursor_calibration?.active == true || phase == "no_displays"
         manualButton.title = phase == "complete" ? "Learn at cursor" : "Learn at cursor"
         headButton.isHidden = true
@@ -290,12 +388,12 @@ final class CalibrationStepsView: NSView {
         actionButton.title = phase == "complete" ? (headRetry ? "Retry head movement" : "Restart calibration") :
             running ? "Stop calibration" : paused ? "Retry step \((current ?? 0) + 1)" : "Start calibration"
         for (index, row) in rows.enumerated() {
-            row.isHidden = index >= (phase == "verify" ? descriptions.count : 2)
+            row.isHidden = index >= ((views || phase == "verify") ? descriptions.count : 2 + offset)
             guard !row.isHidden else { row.stringValue = ""; continue }
             let done = phase == "complete" || current.map { index < $0 } == true
             let selected = current == index
-            let unchangedHead = index == 1 && done && flow?.guided_head_outcome == "previous_fit_kept"
-            let partialHead = index == 1 && done && flow?.guided_head_outcome == "partial"
+            let unchangedHead = index == 1 + offset && done && flow?.guided_head_outcome == "previous_fit_kept"
+            let partialHead = index == 1 + offset && done && flow?.guided_head_outcome == "partial"
             let suffix = unchangedHead ? "  · No correction learned" : partialHead ? "  · One eye corrected" : done ? "  ✓" : selected ? (paused ? "  · Ready to retry" : "  · Active") : ""
             row.stringValue = "\(index + 1). \(descriptions[index])\(suffix)"
             row.font = .systemFont(ofSize: 13, weight: selected ? .semibold : .regular)
@@ -330,7 +428,8 @@ final class CalibrationStepsView: NSView {
                          cursor.positions < 6 && cursor.ready == false ? "Save six positions across the screen; keep your head still" : "Keep watching the stationary pointer while nodding or shifting",
                          "Stop learning before looking away; saved corrections stay", cursor.message]
             for (i,row) in rows.enumerated() {
-                row.isHidden = false
+                row.isHidden = i >= steps.count
+                guard i < steps.count else { row.stringValue = ""; continue }
                 row.stringValue = "\(i+1). \(steps[i])"; row.textColor = .labelColor
             }
             invalidateIntrinsicContentSize(); needsLayout = true
@@ -345,11 +444,24 @@ final class CalibrationStepsView: NSView {
         invalidateIntrinsicContentSize(); needsLayout = true
         if stale { countdown.stringValue = "Waiting for tracker response" }
         else if phase == "idle" { countdown.stringValue = "Ready. Start calibration when you are prepared." }
-        else if phase == "complete" { countdown.stringValue = flow?.message ?? "Ready" }
+        else if phase == "complete" {
+            countdown.stringValue = flow?.message ?? "Ready"
+            if flow?.second_view_fallback_reason != nil {
+                countdown.stringValue += "\nLaptop webcam used; second view not aligned."
+            }
+        }
         else if paused { countdown.stringValue = flow?.blocker == "Stopped by user" ? "Stopped · Completed steps saved" : (flow?.blocker ?? "Stopped · Retry this step") }
         else if phase == "cancelled" { countdown.stringValue = "Calibration cancelled" }
         else if phase == "refine", let learning = flow?.dot_learning {
             countdown.stringValue = "Target \(learning.target_index)/\(learning.target_count) · \(Int(ceil(learning.remaining_seconds)))s available\n\(learning.message)"
+        }
+        else if phase == "fitting" && scan {
+            countdown.stringValue = "\(Int(ceil(flow?.remaining_seconds ?? 0)))s until the first dot\nUse a comfortable range; no target to follow"
+        }
+        else if phase == "preview" { countdown.stringValue = flow?.message ?? "Align with the pupil preview" }
+        else if phase == "views_fit" { countdown.stringValue = flow?.message ?? "Movement captured. Checking the eye models." }
+        else if phase == "views" {
+            countdown.stringValue = "\(Int(ceil(flow?.remaining_seconds ?? 64)))s left · Eye and head movement\n\(flow?.message ?? "Keep both faces visible")"
         }
         else if phase == "motion" {
             let checking = flow?.geometry_calibration?.phase == "validate"
@@ -386,20 +498,32 @@ final class DotPanel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 final class CalibrationView: NSView {
+    var freeEyeInstruction: String? { didSet { needsDisplay = true } }
     var monochrome = false { didSet { needsDisplay = true } }
     var progress = 0.0 { didSet { needsDisplay = true } }
     var accepted = false { didSet { needsDisplay = true } }
     var hollow = false { didSet { needsDisplay = true } }
     var completed = false { didSet { needsDisplay = true } }
     var collecting = false { didSet { needsDisplay = true } }
-    var headCue: String? { didSet { needsDisplay = true } }
+    var headCueStarted = ProcessInfo.processInfo.systemUptime
+    var headCue: String? { didSet { if headCue != oldValue { headCueStarted=ProcessInfo.processInfo.systemUptime }; needsDisplay = true } }
     override var isOpaque: Bool { false }
     override func draw(_ dirtyRect: NSRect) {
         // Only the target and its progress ring are drawn. The desktop remains
         // visible through this small, nonactivating, click-through panel.
         NSColor.clear.setFill()
         bounds.fill(using: .copy)
+        if let instruction = freeEyeInstruction {
+            NSColor.black.withAlphaComponent(0.72).setFill()
+            NSBezierPath(roundedRect: bounds.insetBy(dx: 2, dy: 2), xRadius: 14, yRadius: 14).fill()
+            let paragraph = NSMutableParagraphStyle(); paragraph.alignment = .center
+            (instruction as NSString).draw(in: bounds.insetBy(dx: 16, dy: 16), withAttributes: [
+                .font: NSFont.systemFont(ofSize: 15, weight: .medium), .foregroundColor: NSColor.white,
+                .paragraphStyle: paragraph])
+            return // Preparation instructions only: no fixation dot or progress ring.
+        }
         let center = NSPoint(x: bounds.midX, y: bounds.midY)
+        let ringRadius: CGFloat = 20
         let pupil = NSBezierPath(ovalIn: NSRect(x: center.x - 10, y: center.y - 10, width: 20, height: 20))
         NSColor.white.withAlphaComponent(0.55).setFill()
         if !hollow && !completed { pupil.fill() }
@@ -410,7 +534,7 @@ final class CalibrationView: NSView {
             NSColor.white.setFill()
             NSBezierPath(ovalIn: NSRect(x: center.x - 1, y: center.y - 1, width: 2, height: 2)).fill()
         }
-        let ring = NSBezierPath(ovalIn: NSRect(x: center.x - 20, y: center.y - 20, width: 40, height: 40))
+        let ring = NSBezierPath(ovalIn: NSRect(x: center.x - ringRadius, y: center.y - ringRadius, width: 2*ringRadius, height: 2*ringRadius))
         ring.lineWidth = 4
         NSColor.black.withAlphaComponent(0.3).setStroke()
         ring.stroke()
@@ -424,7 +548,7 @@ final class CalibrationView: NSView {
             arc.lineWidth = 2
             arc.lineCapStyle = .round
             let start: CGFloat = collecting && !completed ? 90-CGFloat(ProcessInfo.processInfo.systemUptime.truncatingRemainder(dividingBy:2))*180 : 90
-            arc.appendArc(withCenter: center, radius: 20, startAngle: start,
+            arc.appendArc(withCenter: center, radius: ringRadius, startAngle: start,
                           endAngle: start - CGFloat(amount) * 360, clockwise: true)
             feedbackColor.withAlphaComponent(0.95).setStroke()
             arc.stroke()
@@ -438,69 +562,110 @@ final class CalibrationView: NSView {
             NSColor.systemGreen.setStroke(); check.stroke()
         }
         if let cue = headCue {
-            let head = NSPoint(x: center.x, y: center.y - 42)
-            if let title = ["shift":"Slide sideways", "depth":"Closer / farther", "pitch":"Nod", "yaw":"Turn"][cue] {
-                let attributes: [NSAttributedString.Key:Any] = [.font:NSFont.systemFont(ofSize:12,weight:.semibold),
-                    .foregroundColor:NSColor.white, .backgroundColor:NSColor.black.withAlphaComponent(0.7)]
+            // The fixation stays at the panel center with the same ring in every
+            // phase. Instructions sit immediately below, outside that ring.
+            let head = NSPoint(x: center.x, y: center.y - 43)
+            NSColor.black.withAlphaComponent(0.78).setFill()
+            NSBezierPath(roundedRect: NSRect(x:center.x-47,y:center.y-70,width:94,height:47),
+                         xRadius:8,yRadius:8).fill()
+            if let title = ["shift":"Slide sideways", "depth":"Closer / farther",
+                            "pitch":"Nod up / down", "yaw":"Turn left / right"][cue] {
+                let attributes: [NSAttributedString.Key:Any] = [.font:NSFont.systemFont(ofSize:11,weight:.semibold),
+                    .foregroundColor:NSColor.white]
                 let size = (title as NSString).size(withAttributes:attributes)
-                (title as NSString).draw(at:NSPoint(x:center.x-size.width/2,y:center.y-90),withAttributes:attributes)
+                (title as NSString).draw(at:NSPoint(x:center.x-size.width/2,y:center.y-69),withAttributes:attributes)
             }
-            NSColor.black.withAlphaComponent(0.55).setFill()
-            NSBezierPath(roundedRect: NSRect(x: head.x - 36, y: head.y - 24, width: 72, height: 48),
-                         xRadius: 12, yRadius: 12).fill()
-            NSColor.white.withAlphaComponent(0.85).setStroke()
-            let motion = sin(ProcessInfo.processInfo.systemUptime * .pi/2)
+            let phase = (ProcessInfo.processInfo.systemUptime-headCueStarted) * .pi/2
+            let motion = sin(phase)
+            let forward = cos(phase) >= 0
+            NSColor.white.setStroke(); NSColor.white.setFill()
             let scale: CGFloat = cue == "depth" ? 1 + 0.25*motion : 1
-            let dx: CGFloat = cue == "shift" ? 8*motion : 0
-            let face = NSBezierPath(ovalIn: NSRect(x: head.x + dx - 7*scale, y: head.y - 9*scale, width: 14*scale, height: 18*scale))
-            face.lineWidth = 1.5; face.stroke()
-            NSColor.white.withAlphaComponent(0.85).setFill()
-            for eyeX in [-3.0, 3.0] {
-                let turn: CGFloat = cue == "yaw" ? 4*motion : 0
-                let nod: CGFloat = cue == "pitch" ? 5*motion : 0
-                NSBezierPath(ovalIn: NSRect(x: head.x + dx + eyeX*scale + turn - 1, y: head.y + 1 + nod, width: 2, height: 2)).fill()
-            }
-            func arrow(_ from: CGPoint, _ to: CGPoint) {
-                let line = NSBezierPath(); line.lineWidth = 1.5
-                line.move(to: from); line.line(to: to)
-                let dx = to.x - from.x, dy = to.y - from.y, length = hypot(dx,dy)
-                let ux = dx/length, uy = dy/length
-                line.move(to: CGPoint(x: to.x - 4*ux + 3*uy, y: to.y - 4*uy - 3*ux))
-                line.line(to: to)
-                line.line(to: CGPoint(x: to.x - 4*ux - 3*uy, y: to.y - 4*uy + 3*ux))
-                line.stroke()
-            }
-            if cue == "depth" {
-                // A side-view monitor plus a growing/shrinking face distinguishes
-                // depth translation from the sideways and turning instructions.
-                let monitor = NSBezierPath(rect:NSRect(x:head.x-30,y:head.y-13,width:3,height:26))
-                monitor.lineWidth = 1.5; monitor.stroke()
-                arrow(CGPoint(x:head.x-12,y:head.y-17),CGPoint(x:head.x-25,y:head.y-17))
-                arrow(CGPoint(x:head.x+12,y:head.y-17),CGPoint(x:head.x+26,y:head.y-17))
-            }
-            if cue == "yaw" || cue == "shift" || cue == "both" {
-                for side in [-1.0, 1.0] {
-                    arrow(CGPoint(x: head.x + 13*side, y: head.y), CGPoint(x: head.x + 29*side, y: head.y))
+            let dx: CGFloat = cue == "shift" ? -8*motion : 0
+            if cue == "pitch" {
+                // Rear view throughout: pitch foreshortens the round head around
+                // a fixed ear-to-ear axle, without switching to a face profile.
+                let height: CGFloat = 18 + 4*motion
+                let face=NSBezierPath(ovalIn:NSRect(x:head.x-8,y:head.y-height/2,width:16,height:height))
+                face.lineWidth=2; face.stroke()
+                let axle=NSBezierPath()
+                axle.move(to:NSPoint(x:head.x-14,y:head.y))
+                axle.line(to:NSPoint(x:head.x+14,y:head.y))
+                axle.lineWidth=1.5; axle.stroke()
+                for side in [-1.0,1.0] {
+                    NSBezierPath(ovalIn:NSRect(x:head.x+9*side-2,y:head.y-3,width:4,height:6)).fill()
+                }
+            } else {
+                let face = NSBezierPath(ovalIn: NSRect(x: head.x + dx - 7*scale, y: head.y - 9*scale,
+                                                      width: 14*scale, height: 18*scale))
+                face.lineWidth = 2; face.stroke()
+                // Consistent rear view: ears, no facial features that imply mirroring.
+                let turn: CGFloat = cue == "yaw" ? -3*motion : 0
+                for side in [-1.0,1.0] {
+                    NSBezierPath(ovalIn:NSRect(x:head.x+dx+side*8*scale+turn-1.5,
+                                              y:head.y-2,width:3,height:5)).fill()
                 }
             }
+            func arrowTip(_ tip: CGPoint, tangent: CGPoint) {
+                let length = hypot(tangent.x,tangent.y)
+                guard length > 0 else { return }
+                let ux=tangent.x/length, uy=tangent.y/length
+                let path=NSBezierPath()
+                path.move(to:CGPoint(x:tip.x-5*ux+3*uy,y:tip.y-5*uy-3*ux))
+                path.line(to:tip)
+                path.line(to:CGPoint(x:tip.x-5*ux-3*uy,y:tip.y-5*uy+3*ux))
+                path.lineWidth=2.2; path.lineCapStyle = .round; path.lineJoinStyle = .round; path.stroke()
+            }
+            func arrow(_ from: CGPoint, _ to: CGPoint) {
+                let line=NSBezierPath(); line.lineWidth=2.2; line.lineCapStyle = .round
+                line.move(to:from); line.line(to:to); line.stroke()
+                arrowTip(to,tangent:CGPoint(x:to.x-from.x,y:to.y-from.y))
+            }
+            func rotationArrow(origin: CGPoint, rx: CGFloat, ry: CGFloat, start: CGFloat, end: CGFloat) {
+                let arc=NSBezierPath()
+                for i in 0...32 {
+                    let angle=start+(end-start)*CGFloat(i)/32
+                    let point=CGPoint(x:origin.x+rx*cos(angle),y:origin.y+ry*sin(angle))
+                    if i == 0 { arc.move(to:point) } else { arc.line(to:point) }
+                }
+                arc.lineWidth=2.2; arc.lineCapStyle = .round; arc.stroke()
+                let direction: CGFloat = end > start ? 1 : -1
+                arrowTip(CGPoint(x:origin.x+rx*cos(end),y:origin.y+ry*sin(end)),
+                         tangent:CGPoint(x:-rx*sin(end)*direction,y:ry*cos(end)*direction))
+            }
             if cue == "pitch" || cue == "both" {
-                for side in [-1.0, 1.0] {
-                    arrow(CGPoint(x: head.x, y: head.y + 12*side), CGPoint(x: head.x, y: head.y + 21*side))
+                // Vertical half-circle: tilt around the horizontal ear-to-ear axis.
+                rotationArrow(origin:CGPoint(x:head.x+9,y:head.y+3),rx:12,ry:12,
+                              start:forward ? -.pi/2 : .pi/2,end:forward ? .pi/2 : -.pi/2)
+            }
+            if cue == "yaw" || cue == "both" {
+                // Horizontal half-circle: turn around the upright neck axis.
+                rotationArrow(origin:CGPoint(x:head.x,y:head.y+2),rx:25,ry:14,
+                              start:forward ? .pi : 0,end:forward ? 0 : .pi)
+            }
+            if cue == "depth" {
+                let monitor=NSBezierPath(rect:NSRect(x:head.x-30,y:head.y-11,width:3,height:23))
+                monitor.lineWidth=2; monitor.stroke()
+                arrow(CGPoint(x:head.x-12,y:head.y),CGPoint(x:head.x-23,y:head.y))
+                arrow(CGPoint(x:head.x+12,y:head.y),CGPoint(x:head.x+28,y:head.y))
+            }
+            if cue == "shift" {
+                for side in [-1.0,1.0] {
+                    arrow(CGPoint(x:head.x+18*side,y:head.y),CGPoint(x:head.x+33*side,y:head.y))
                 }
             }
             if cue == "left" || cue == "right" {
                 let sign = cue == "left" ? -1.0 : 1.0
-                arrow(CGPoint(x: head.x + 13*sign, y: head.y), CGPoint(x: head.x + 29*sign, y: head.y))
+                arrow(CGPoint(x:head.x+13*sign,y:head.y),CGPoint(x:head.x+29*sign,y:head.y))
             }
             if cue == "up" || cue == "down" {
                 let sign = cue == "up" ? 1.0 : -1.0
-                arrow(CGPoint(x: head.x, y: head.y + 12*sign), CGPoint(x: head.x, y: head.y + 21*sign))
+                arrow(CGPoint(x:head.x+12,y:head.y),CGPoint(x:head.x+12,y:head.y+15*sign))
             }
             for (name, dx, dy) in [("top-left", -1.0, 1.0), ("top-right", 1.0, 1.0),
                                    ("bottom-right", 1.0, -1.0), ("bottom-left", -1.0, -1.0)] {
                 if cue == name || cue == "cone" {
-                    arrow(CGPoint(x: head.x + 12*dx, y: head.y + 9*dy),
-                          CGPoint(x: head.x + 28*dx, y: head.y + 20*dy))
+                    arrow(CGPoint(x:head.x+12*dx,y:head.y+5*dy),
+                          CGPoint(x:head.x+28*dx,y:head.y+13*dy))
                 }
             }
         }
@@ -583,11 +748,283 @@ final class CameraSidebarDivider: NSView {
     }
 }
 
+final class RecordCaptureButton:NSButton {
+    override func draw(_ dirtyRect:NSRect) {
+        NSColor.systemRed.withAlphaComponent(isEnabled ? 1 : 0.5).setFill()
+        NSColor.systemRed.withAlphaComponent(isEnabled ? 1 : 0.5).setStroke()
+        let center=NSPoint(x:bounds.midX,y:bounds.midY)
+        NSBezierPath(ovalIn:NSRect(x:center.x-5,y:center.y-5,width:10,height:10)).fill()
+        let rim=NSBezierPath(ovalIn:NSRect(x:center.x-9,y:center.y-9,width:18,height:18))
+        rim.lineWidth=1.5;rim.stroke()
+    }
+}
+struct ReplayCursor: Codable {
+    let point: [Double]
+    let opacity: Double
+}
+struct ReplayTimeline: Decodable {
+    let id: String
+    let duration_ms: Double
+    let frames: [Double]
+    let has_scene: Bool
+}
+struct ReplayFrame: Decodable {
+    let t_ms: Double
+    let images: [String:String]
+    let camera_times: [String:Double]
+    let state: TrackerState?
+    let cursors: [String:ReplayCursor]
+    let scene: [String:Double]?
+}
+final class DiagnosticRecordingController: NSObject {
+    let view=NSStackView()
+    let record=RecordCaptureButton()
+    let play=NSButton(), stop=NSButton(), previous=NSButton(), next=NSButton()
+    let slider=NSSlider(value:0,minValue:0,maxValue:1,target:nil,action:nil)
+    let status=NSTextField(labelWithString:"Live")
+    var ensureService: ((@escaping (String?)->Void)->Void)?
+    var canReplay: ()->Bool = { true }
+    var modeChanged: ((Bool)->Void)?
+    var frameReady: ((ReplayFrame,[String:NSImage])->Void)?
+    var initialized=false, connecting=false, busy=false
+    var activeID: String?, recordingPaused=false
+    var timeline: ReplayTimeline?
+    private(set) var replaying=false
+    private(set) var playing=false
+    private(set) var playhead=0.0
+    private var framePending=false, frameGeneration=0, commandRevision=0
+    private var frameWanted=false, lastTick=ProcessInfo.processInfo.systemUptime
+    private var lastPoll=0.0, statusPending=false, presentationPending=false, lastPresentation=0.0
+    private var clock:Timer?
+    override init() {
+        super.init()
+        view.orientation = .vertical;view.alignment = .leading;view.spacing=5
+        view.edgeInsets=NSEdgeInsets(top:8,left:12,bottom:8,right:12)
+        let buttons=NSStackView();buttons.spacing=5
+        for (button,symbol,label,action) in [
+            (record,"record.circle.fill","Record (replaces previous recording)",#selector(startRecording)),
+            (play,"play.fill","Play recording",#selector(togglePlay)),
+            (stop,"stop.fill","Stop recording / return to live",#selector(stopAction)),
+            (previous,"backward.end.fill","Previous camera frame",#selector(stepBack)),
+            (next,"forward.end.fill","Next camera frame",#selector(stepForward))] {
+            button.image=NSImage(systemSymbolName:symbol,accessibilityDescription:label)
+            button.imagePosition = .imageOnly;button.bezelStyle = .texturedRounded
+            button.toolTip=label;button.setAccessibilityLabel(label)
+            button.target=self;button.action=action
+            button.widthAnchor.constraint(equalToConstant:30).isActive=true
+            button.heightAnchor.constraint(equalToConstant:26).isActive=true
+            buttons.addArrangedSubview(button)
+        }
+        buttons.addArrangedSubview(NSView())
+        record.contentTintColor = .systemRed
+        slider.target=self;slider.action=#selector(scrub);slider.isContinuous=true
+        slider.setAccessibilityLabel("Recording timeline")
+        status.font = .monospacedDigitSystemFont(ofSize:10,weight:.regular)
+        status.lineBreakMode = .byTruncatingTail
+        for item in [buttons,slider,status] as [NSView] {
+            view.addArrangedSubview(item)
+            item.translatesAutoresizingMaskIntoConstraints=false
+            item.widthAnchor.constraint(equalTo:view.widthAnchor,constant:-24).isActive=true
+        }
+        refreshControls()
+        let timer=Timer(timeInterval:1.0/30,repeats:true) { [weak self] _ in self?.tick() }
+        clock=timer;RunLoop.main.add(timer,forMode:.common)
+    }
+    deinit { clock?.invalidate() }
+    func call(_ path:String, body:[String:Any]?=nil, completion:@escaping (Data?,String?)->Void) {
+        var req=URLRequest(url:URL(string:"http://127.0.0.1:8766"+path)!,cachePolicy:.reloadIgnoringLocalCacheData,timeoutInterval:30)
+        if let body=body {
+            req.httpMethod="POST";req.setValue("application/json",forHTTPHeaderField:"Content-Type")
+            req.httpBody=try? JSONSerialization.data(withJSONObject:body)
+        }
+        URLSession.shared.dataTask(with:req) { data,response,error in
+            var message=error?.localizedDescription
+            if (response as? HTTPURLResponse)?.statusCode != 200 {
+                let json=data.flatMap { try? JSONSerialization.jsonObject(with:$0) as? [String:Any] }
+                message=json?["error"] as? String ?? message ?? "Recorder unavailable"
+            }
+            DispatchQueue.main.async { completion(data,message) }
+        }.resume()
+    }
+    func message(_ text:String) { status.stringValue=text;status.toolTip=text }
+    func connect(_ completion:((Bool)->Void)?=nil) {
+        if initialized { completion?(true);return }
+        guard !connecting else { completion?(false);return }
+        connecting=true
+        ensureService? { [weak self] error in
+            guard let self=self else { return }
+            self.connecting=false
+            if let error=error { self.message(error);completion?(false);return }
+            self.initialized=true;self.loadLatest();completion?(true)
+        }
+    }
+    func loadLatest() {
+        call("/api/sessions") { [weak self] data,error in
+            guard let self=self,error == nil,let data=data,
+                  let rows=try? JSONSerialization.jsonObject(with:data) as? [[String:Any]],
+                  let row=rows.first,let id=row["id"] as? String,
+                  row["status"] as? String != "recording" else { return }
+            self.loadTimeline(id,show:false)
+        }
+    }
+    func loadTimeline(_ id:String,show:Bool) {
+        let revision=commandRevision
+        call("/api/sessions/\(id)/timeline") { [weak self] data,error in
+            guard let self=self else { return }
+            if let error=error { self.message(error);return }
+            guard let data=data,let timeline=try? JSONDecoder().decode(ReplayTimeline.self,from:data) else {
+                self.message("Recording timeline unavailable");return
+            }
+            guard self.activeID == nil,self.commandRevision == revision else { return }
+            self.timeline=timeline;self.slider.maxValue=max(1,timeline.duration_ms)
+            self.refreshControls()
+            if show { self.seek(0) }
+            else if !self.replaying { self.message("Saved · press Play to review") }
+        }
+    }
+    func refreshControls() {
+        record.isEnabled = !busy && activeID == nil
+        play.isEnabled = !busy && (activeID != nil || timeline != nil)
+        stop.isEnabled = !busy && (activeID != nil || replaying)
+        previous.isEnabled = !busy && activeID == nil && timeline != nil
+        next.isEnabled=previous.isEnabled;slider.isEnabled=previous.isEnabled
+        let pausing = activeID != nil ? !recordingPaused : playing
+        play.image=NSImage(systemSymbolName:pausing ? "pause.fill" : "play.fill",accessibilityDescription:pausing ? "Pause" : "Play")
+        play.toolTip=activeID != nil ? (recordingPaused ? "Resume recording" : "Pause recording") : (playing ? "Pause replay" : "Play recording")
+        play.setAccessibilityLabel(play.toolTip)
+    }
+    func enterReplay()->Bool {
+        if replaying { return true }
+        guard canReplay() else { message("Finish calibration before replay");return false }
+        guard timeline != nil else { return false }
+        replaying=true;modeChanged?(true);return true
+    }
+    func returnLive() {
+        playing=false;replaying=false;frameGeneration+=1;frameWanted=false
+        modeChanged?(false);message("Live");refreshControls()
+    }
+    @objc func startRecording() {
+        guard !busy,activeID == nil else { return }
+        connect { [weak self] ok in
+            guard let self=self,ok else { return }
+            self.commandRevision+=1;self.busy=true;self.refreshControls();self.message("Starting recording…")
+            self.call("/api/start",body:["display_id":0]) { data,error in
+                self.busy=false
+                if let error=error { self.message(error);self.refreshControls();return }
+                let row=data.flatMap { try? JSONSerialization.jsonObject(with:$0) as? [String:Any] }
+                self.activeID=row?["id"] as? String;self.timeline=nil;self.recordingPaused=false
+                self.returnLive();self.message("Recording 00:00 / 01:00");self.refreshControls()
+            }
+        }
+    }
+    @objc func togglePlay() {
+        guard !busy else { return }
+        if activeID != nil {
+            commandRevision+=1;busy=true;refreshControls()
+            call("/api/pause",body:["paused":!recordingPaused]) { [weak self] data,error in
+                guard let self=self else { return };self.busy=false
+                if let error=error { self.message(error) }
+                else { self.recordingPaused.toggle() }
+                self.refreshControls();self.pollStatus()
+            };return
+        }
+        guard enterReplay() else { return }
+        if playing { playing=false;seek(playhead) }
+        else {
+            if playhead >= (timeline?.duration_ms ?? 0) { playhead=0 }
+            playing=true;lastTick=ProcessInfo.processInfo.systemUptime;frameWanted=true;requestFrame()
+        }
+        refreshControls()
+    }
+    @objc func stopAction() {
+        guard !busy else { return }
+        if activeID == nil { returnLive();return }
+        commandRevision+=1;busy=true;refreshControls();message("Saving recording…")
+        call("/api/stop",body:[:]) { [weak self] data,error in
+            guard let self=self else { return };self.busy=false
+            if let error=error { self.message(error);self.refreshControls();return }
+            let row=data.flatMap { try? JSONSerialization.jsonObject(with:$0) as? [String:Any] }
+            let id=self.activeID;self.activeID=nil;self.recordingPaused=false
+            self.refreshControls()
+            if let id=row?["id"] as? String ?? id { self.loadTimeline(id,show:false) }
+        }
+    }
+    func seek(_ ms:Double) {
+        guard activeID == nil,enterReplay() else { return }
+        playing=false;playhead=max(0,min(timeline?.duration_ms ?? 0,ms));slider.doubleValue=playhead
+        frameGeneration+=1;frameWanted=true;message("Seeking \(Self.time(playhead))")
+        refreshControls();requestFrame()
+    }
+    @objc func scrub() { seek(slider.doubleValue) }
+    @objc func stepBack() { step(-1) }
+    @objc func stepForward() { step(1) }
+    func step(_ direction:Int) {
+        guard let times=timeline?.frames,!times.isEmpty else { return }
+        let next=direction > 0 ? times.first { $0 > playhead+0.01 } : times.last { $0 < playhead-0.01 }
+        seek(next ?? (direction > 0 ? times.last! : times.first!))
+    }
+    static func time(_ ms:Double)->String {
+        String(format:"%02d:%02d.%03d",Int(ms)/60000,(Int(ms)/1000)%60,Int(ms)%1000)
+    }
+    func requestFrame() {
+        guard replaying,frameWanted,!framePending,let timeline=timeline else { return }
+        framePending=true;frameWanted=false
+        let generation=frameGeneration
+        call("/api/replay",body:["session_id":timeline.id,"t_ms":playhead]) { [weak self] data,error in
+            guard let self=self else { return };self.framePending=false
+            guard self.replaying,self.frameGeneration == generation else { self.requestFrame();return }
+            if let error=error { self.playing=false;self.message(error);self.refreshControls();return }
+            guard let data=data,let frame=try? JSONDecoder().decode(ReplayFrame.self,from:data) else {
+                self.playing=false;self.message("Could not read recorded frame");self.refreshControls();return
+            }
+            let images=frame.images.compactMapValues { Data(base64Encoded:$0).flatMap(NSImage.init(data:)) }
+            self.frameReady?(frame,images);self.slider.doubleValue=frame.t_ms
+            self.message("\(self.playing ? "Replay" : "Paused") \(Self.time(frame.t_ms)) / \(Self.time(timeline.duration_ms))")
+        }
+    }
+    func tick() {
+        let now=ProcessInfo.processInfo.systemUptime
+        if initialized,now-lastPoll>=1 { lastPoll=now;pollStatus() }
+        if playing,replaying {
+            playhead=min(timeline?.duration_ms ?? 0,playhead+(now-lastTick)*1000)
+            frameWanted=true;requestFrame()
+            if playhead >= (timeline?.duration_ms ?? 0) { playing=false;refreshControls() }
+        }
+        lastTick=now
+    }
+    func pollStatus() {
+        guard initialized,!statusPending,!busy else { return }
+        statusPending=true
+        let revision=commandRevision
+        call("/api/status") { [weak self] data,error in
+            guard let self=self else { return };self.statusPending=false
+            guard !self.busy,self.commandRevision == revision,error == nil,let data=data,let row=try? JSONSerialization.jsonObject(with:data) as? [String:Any] else { return }
+            let old=self.activeID
+            self.activeID=row["active"] as? String;self.recordingPaused=row["paused"] as? Bool ?? false
+            if self.activeID != nil {
+                if self.replaying { self.returnLive() }
+                self.message("\(self.recordingPaused ? "Record paused" : "Recording") \(Self.time((row["elapsed_seconds"] as? Double ?? 0)*1000)) / 01:00")
+            } else if old != nil,let id=row["last_finished"] as? String { self.loadTimeline(id,show:false) }
+            self.refreshControls()
+        }
+    }
+    func capture(_ cursors:[String:ReplayCursor], scene:[String:Double], at stamp:Double) {
+        guard let id=activeID,!recordingPaused,!presentationPending,stamp-lastPresentation>=1.0/30 else { return }
+        presentationPending=true;lastPresentation=stamp
+        let points=cursors.mapValues { ["point":$0.point,"opacity":$0.opacity] as [String:Any] }
+        call("/api/presentation",body:["session_id":id,"captured_at":stamp,"cursors":points,"scene":scene]) { [weak self] _,_ in self?.presentationPending=false }
+    }
+}
+
 final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate {
     enum PreviewAlignmentAction { case start, finish }
     let port: Int
     let hybrid: Bool
     let parentPID = getppid()
+    let recording=DiagnosticRecordingController()
+    var replaying:Bool { recording.replaying }
+    var presentedCursors:[String:ReplayCursor]=[:]
+    var liveSceneConfiguration:[String:Double]?
     // Calibration uses the same kind of desktop overlay as the gaze cursor.
     let window = DotPanel(contentRect: NSRect(x: 0, y: 0, width: 96, height: 140),
                           styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
@@ -628,7 +1065,10 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
     var eyeCameraMenuOpen = false
     var deferredEyeSetup: EyeCamerasState?
     var eyeSetupSignature = ""
+    let calibrationVoice = CalibrationVoiceGuide()
+    let voiceGuidance = NSButton(checkboxWithTitle: "Spoken guidance", target: nil, action: nil)
     let previewAlignButton = NSButton(title: "Align with IR preview", target: nil, action: nil)
+    var previewReferencePending = false
     var pendingPreviewAlignment: PreviewAlignmentAction?
     let diagnosticText = NSTextField(wrappingLabelWithString:
         "Waiting for eye camera. Drag around the eye to exclude a dark corner. Green: accepted pupil/ray · Cyan: modeled eye center · Magenta: seed · Red: rejected")
@@ -733,6 +1173,8 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
         diagnosticText.textColor = NSColor.white.withAlphaComponent(0.75)
         diagnosticText.font = .systemFont(ofSize: 12)
         calibrationSteps.actionButton.target = self
+        calibrationSteps.muteButton.target = self
+        calibrationSteps.muteButton.action = #selector(toggleVoiceMute)
         calibrationSteps.actionButton.action = #selector(continueCalibration)
         calibrationSteps.manualButton.target = self
         calibrationSteps.manualButton.action = #selector(alignWithCursor)
@@ -879,6 +1321,12 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
     }
 
     func updateMenu() {
+        defer {
+            if replaying {
+                for item in [calibrateMenu,cursorAlignMenu,headPracticeMenu,cancelMenu,blinkMenu] { item.isEnabled=false }
+                for button in [calibrationSteps.actionButton,calibrationSteps.manualButton,calibrationSteps.headButton,accuracyButton] { button.isEnabled=false }
+            }
+        }
         let fresh = Date().timeIntervalSince(lastReply) <= 0.6
         let ready = fresh && lastState?.camera_connected == true && lastState?.source != "video demo"
         let cursorSession = lastState?.onboarding?.cursor_calibration
@@ -891,7 +1339,7 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
         previewAlignButton.isEnabled = true
         calibrateMenu.isEnabled = ready && !changing
         calibrateMenu.title = lastState?.onboarding?.phase == "idle" ? "Start calibration" : "Restart calibration"
-        cursorAlignMenu.isEnabled = fresh && !changing && hybrid && !["no_displays","waiting","fitting","head","screen","motion","verify","refine"].contains(lastState?.onboarding?.phase ?? "")
+        cursorAlignMenu.isEnabled = fresh && !changing && hybrid && !["no_displays","preview","views_fit","views","waiting","fitting","head","screen","motion","verify","refine"].contains(lastState?.onboarding?.phase ?? "")
         let practicing = lastState?.onboarding?.phase != "motion" && lastState?.onboarding?.cursor_calibration?.active == true && lastState?.onboarding?.cursor_calibration?.stage == "geometry"
         let continuousHead = practicing && lastState?.onboarding?.geometry_calibration?.continuous == true
         headPracticeMenu.isHidden = !practicing
@@ -975,6 +1423,7 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
     }
 
     func request(_ path: String, body: [String: Any], completion: @escaping (String?) -> Void) {
+        if replaying && path != "/recordings/open" { completion("Stop replay to change tracking");return }
         generation += 1
         var request = URLRequest(url: URL(string: "http://127.0.0.1:\(port)\(path)")!, timeoutInterval: 2)
         request.httpMethod = "POST"
@@ -995,7 +1444,9 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
         changing = true
         localError = nil
         hideCursor()
-        request("/onboarding/start", body: [:]) { [weak self] error in
+        showDiagnostics()
+        if let screen=calibrationScreen() { diagnosticWindow.setFrame(screen.visibleFrame,display:true) }
+        request("/onboarding/start", body: ["preview_alignment":true]) { [weak self] error in
             self?.changing = false
             self?.localError = error
             self?.restore()
@@ -1027,7 +1478,7 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
             } else { restartOnboarding() }
             return
         }
-        if ["waiting", "fitting", "head", "screen", "motion", "verify", "refine"].contains(flow.phase) {
+        if ["preview", "views_fit", "views", "waiting", "fitting", "head", "screen", "motion", "verify", "refine"].contains(flow.phase) {
             changing = true; localError = nil
             request("/onboarding/stop", body: [:]) { [weak self] error in
                 guard let self = self else { return }
@@ -1178,8 +1629,32 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
         }.resume()
     }
 
+    func preparePreviewReference(_ flow: OnboardingState) {
+        guard flow.phase == "preview", let step=flow.preview_alignment, step.target == nil,
+              let side=step.eye, !previewReferencePending,
+              let eye=lastState?.eye_cameras?.eyes[side], eye.measurement_valid == true,
+              let pupil=eye.pupil_center, pupil.count == 2, pupil.allSatisfy({ $0.isFinite }),
+              let screen=calibrationScreen() else { return }
+        let image=side == "left" ? preview : secondaryEyePreview
+        image.scrollToVisible(image.bounds)
+        diagnosticWindow.contentView?.layoutSubtreeIfNeeded()
+        let local=NSPoint(x:pupil[0]/640*image.bounds.width,y:(1-pupil[1]/480)*image.bounds.height)
+        guard image.visibleRect.contains(local) else { return }
+        let point=diagnosticWindow.convertPoint(toScreen:image.convert(local,to:nil))
+        guard screen.frame.contains(point) else { return }
+        let uv=[(point.x-screen.frame.minX)/screen.frame.width,(screen.frame.maxY-point.y)/screen.frame.height]
+        previewReferencePending=true
+        request("/onboarding/preview-target",body:["eye":side,"target":uv]) { [weak self] error in
+            self?.previewReferencePending=false;self?.localError=error
+        }
+    }
+
     func renderOnboarding(_ flow: OnboardingState) {
-        let showing = ["fitting", "head", "screen", "motion", "verify", "refine"].contains(flow.phase)
+        if flow.phase == "preview" {
+            preparePreviewReference(flow)
+            if flow.target == nil { window.orderOut(nil);return }
+        }
+        let showing = ["preview", "views_fit", "views", "fitting", "head", "screen", "motion", "verify", "refine"].contains(flow.phase)
         guard showing, let screen = NSScreen.screens.first(where: {
             ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.stringValue == flow.display_id
         }) else {
@@ -1189,6 +1664,18 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
         active = true
         displayFrame = screen.frame
         hideCursor()
+        if flow.phase == "fitting" && flow.eye_scan_enabled == true {
+            calibrationTravel.reset(); calibrationOrbit.reset()
+            surface.headCue = nil
+            surface.freeEyeInstruction = "Look around slowly in circles\nKeep your head still; use a comfortable range\n\(Int(ceil(flow.remaining_seconds ?? 0)))s until the first dot"
+            window.setContentSize(NSSize(width: 430, height: 112))
+            placeCalibrationTarget(CGPoint(x: 0.5, y: 0.5))
+            return
+        }
+        if surface.freeEyeInstruction != nil {
+            surface.freeEyeInstruction = nil
+            window.setContentSize(NSSize(width: 96, height: 140))
+        }
         let key = flow.screen_path == "quick"
             ? "\(flow.calibration_session_id ?? "")|\(flow.display_id ?? "")|quick|\(flow.screen_path_started_at ?? 0)|\(flow.screen_target_index ?? 0)"
             : "\(flow.calibration_session_id ?? "")|\(flow.display_id ?? "")|\(flow.phase)|\(flow.target ?? [])"
@@ -1196,7 +1683,7 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
         // calibration session starts a fresh ring. Sampling still validates each fixation.
         calibrationFeedback.update(key: key, progress: flow.progress,
                                    accepted: flow.sample_accepted ?? (lastState?.valid ?? false))
-        surface.headCue = flow.phase == "motion" ? flow.cursor_calibration?.head_cue : flow.phase == "head" ? flow.head_cue : nil
+        surface.headCue = flow.phase == "motion" ? flow.cursor_calibration?.head_cue : ["head", "views"].contains(flow.phase) ? flow.head_cue : nil
         surface.progress = calibrationFeedback.progress
         surface.accepted = calibrationFeedback.accepted
         if flow.screen_path == "quick" {
@@ -1233,6 +1720,8 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
     }
 
     func restore() {
+        surface.freeEyeInstruction = nil
+        window.setContentSize(NSSize(width: 96, height: 140))
         active = false
         calibrationOrbit.reset()
         calibrationTravel.reset()
@@ -1285,7 +1774,7 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
         case "idle": return "Ready to calibrate"
         case "paused": return "Calibration incomplete"
         case "cancelled": return "Calibration cancelled"
-        case "fitting", "head", "screen", "motion", "verify", "refine", "cursor": return "Calibrating"
+        case "preview", "views_fit", "views", "fitting", "head", "screen", "motion", "verify", "refine", "cursor": return "Calibrating"
         default: return "Waiting for calibration"
         }
     }
@@ -1302,12 +1791,27 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
         diagnosticWindow.minSize = NSSize(width: 1100, height: 690)
         diagnosticWindow.collectionBehavior = [.fullScreenPrimary]
         let root = diagnosticWindow.contentView!
+        let eyeOutlineHelp = "White: detected iris. Blue: estimated eyeball projection, shown only with a supported fit. Pixel sizes can differ between cameras."
+        preview.toolTip = eyeOutlineHelp
+        secondaryEyePreview.toolTip = eyeOutlineHelp
         versionLabel.stringValue = buildVersion
         versionLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
         versionLabel.textColor = .white
         versionLabel.alignment = .right
         versionLabel.translatesAutoresizingMaskIntoConstraints = false
         root.addSubview(versionLabel)
+        let recordingControls=recording.view
+        recordingControls.translatesAutoresizingMaskIntoConstraints=false
+        root.addSubview(recordingControls)
+        recording.ensureService = { [weak self] completion in
+            self?.request("/recordings/open",body:[:],completion:completion)
+        }
+        recording.canReplay = { [weak self] in
+            guard let self=self else { return false }
+            return !self.active && self.lastState?.onboarding?.cursor_calibration?.active != true
+        }
+        recording.modeChanged = { [weak self] enabled in self?.setReplayMode(enabled) }
+        recording.frameReady = { [weak self] frame,images in self?.renderReplay(frame,images:images) }
         let cameras = NSScrollView()
         cameras.contentView = DiagnosticsClipView()
         cameras.hasVerticalScroller = true
@@ -1331,7 +1835,11 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
         NSLayoutConstraint.activate([
             cameras.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             cameras.topAnchor.constraint(equalTo: root.topAnchor),
-            cameras.bottomAnchor.constraint(equalTo: versionLabel.topAnchor, constant: -6),
+            cameras.bottomAnchor.constraint(equalTo:recordingControls.topAnchor),
+            recordingControls.leadingAnchor.constraint(equalTo:cameras.leadingAnchor),
+            recordingControls.trailingAnchor.constraint(equalTo:cameras.trailingAnchor),
+            recordingControls.bottomAnchor.constraint(equalTo:root.bottomAnchor),
+            recordingControls.heightAnchor.constraint(equalToConstant:86),
             versionLabel.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -12),
             versionLabel.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -6),
             versionLabel.heightAnchor.constraint(equalToConstant: 16),
@@ -1339,7 +1847,7 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
             cameras.widthAnchor.constraint(greaterThanOrEqualToConstant: 220),
             cameraDivider.leadingAnchor.constraint(equalTo: cameras.trailingAnchor),
             cameraDivider.topAnchor.constraint(equalTo: cameras.topAnchor),
-            cameraDivider.bottomAnchor.constraint(equalTo: cameras.bottomAnchor),
+            cameraDivider.bottomAnchor.constraint(equalTo:root.bottomAnchor),
             cameraDivider.widthAnchor.constraint(equalToConstant: 8),
             stack.leadingAnchor.constraint(equalTo: cameras.contentView.leadingAnchor),
             stack.trailingAnchor.constraint(equalTo: cameras.contentView.trailingAnchor),
@@ -1347,7 +1855,7 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
             angles.leadingAnchor.constraint(equalTo: cameraDivider.trailingAnchor),
             angles.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             angles.topAnchor.constraint(equalTo: root.topAnchor),
-            angles.bottomAnchor.constraint(equalTo: cameras.bottomAnchor)
+            angles.bottomAnchor.constraint(equalTo: versionLabel.topAnchor,constant:-6)
         ])
         func add(_ view: NSView, height: CGFloat? = nil) {
             view.translatesAutoresizingMaskIntoConstraints = false
@@ -1446,6 +1954,9 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
             secondHeadMessage.textColor = .secondaryLabelColor
             addSetup(secondHeadMessage, height: 112)
         }
+        setVoiceGuidance(UserDefaults.standard.object(forKey: "spokenCalibrationGuidance") as? Bool ?? true, persist: false)
+        voiceGuidance.target=self;voiceGuidance.action=#selector(toggleVoiceGuidance)
+        addSetup(voiceGuidance,height:22)
         leftRotation.state = .on
         eyeSetupStatus.font = .systemFont(ofSize: 11)
         eyeSetupStatus.textColor = .secondaryLabelColor
@@ -1571,7 +2082,8 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
                 options.append(EyeCameraDevice(id: selected, name: "Disconnected camera"))
             }
             for (index, device) in options.enumerated() {
-                let name = device.name.count > 22 ? String(device.name.prefix(21)) + "…" : device.name
+                let label = device.name == "USB Camera" && device.id.hasPrefix("0x") ? "USB · " + String(device.id.dropFirst(2).prefix(8)) : device.name
+                    let name = label.count > 22 ? String(label.prefix(21)) + "…" : label
                 let item = NSMenuItem(title: "\(index + 1) · \(name)", action: nil, keyEquivalent: "")
                 item.representedObject = device.id
                 item.toolTip = "\(device.name) [\(device.id)]"
@@ -1613,6 +2125,12 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
         }
         trackingEyeTitle.stringValue = "Left eye · \(rig.eyes["left"]?.rotation ?? 0)°"
         secondaryEyeTitle.stringValue = "Right eye · \(rig.eyes["right"]?.rotation ?? 0)°"
+        for (side,label) in [("left",trackingEyeTitle),("right",secondaryEyeTitle)] {
+            if let model=rig.eyes[side]?.eyeball_model_status {
+                label.stringValue += model == "estimated" ? " · Model fitted" : " · Model pending"
+                label.lineBreakMode = .byTruncatingTail
+            }
+        }
         diagnosticRate.stringValue = Self.eyeRate(rig.eyes["left"])
         secondaryEyeStatus.stringValue = Self.eyeRate(rig.eyes["right"])
         diagnosticRate.toolTip = rig.eyes["left"]?.error ?? diagnosticRate.stringValue
@@ -1639,7 +2157,8 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
                     options.append(EyeCameraDevice(id: selected, name: "Disconnected camera"))
                 }
                 for (index, device) in options.enumerated() {
-                    let name = device.name.count > 22 ? String(device.name.prefix(21)) + "…" : device.name
+                    let label = device.name == "USB Camera" && device.id.hasPrefix("0x") ? "USB · " + String(device.id.dropFirst(2).prefix(8)) : device.name
+                    let name = label.count > 22 ? String(label.prefix(21)) + "…" : label
                     // Identical USB cameras often share the same ID suffix.
                     // NSPopUpButton replaces duplicate titles, so number every
                     // option and insert actual menu items with unique IDs.
@@ -1658,6 +2177,24 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
         leftFixedSphere.state = rig.eyes["left"]?.fixed_eye_sphere == true ? .on : .off
         rightFixedSphere.state = rig.eyes["right"]?.fixed_eye_sphere == true ? .on : .off
         if let error = rig.error { eyeSetupStatus.stringValue = error }
+    }
+    @objc func toggleVoiceGuidance() {
+        setVoiceGuidance(voiceGuidance.state == .on)
+    }
+    @objc func toggleVoiceMute() {
+        setVoiceGuidance(!calibrationVoice.enabled)
+    }
+    func setVoiceGuidance(_ enabled: Bool, persist: Bool = true) {
+        calibrationVoice.enabled = enabled
+        voiceGuidance.state = enabled ? .on : .off
+        let button = calibrationSteps.muteButton
+        button.title = enabled ? "Mute" : "Unmute"
+        button.image = NSImage(systemSymbolName: enabled ? "speaker.wave.2.fill" : "speaker.slash.fill",
+                               accessibilityDescription: nil)
+        button.setAccessibilityLabel(enabled ? "Mute spoken instructions" : "Unmute spoken instructions")
+        button.toolTip = enabled ? "Mute spoken instructions" : "Unmute spoken instructions"
+        if persist { UserDefaults.standard.set(enabled, forKey: "spokenCalibrationGuidance") }
+        if !enabled { calibrationVoice.silence() }
     }
     @objc func changeEyeSetup() {
         guard !eyeSetupPending else { return }
@@ -1690,7 +2227,7 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
         }
     }
     func refreshDiagnosticFrame() {
-        guard diagnosticWindow.isVisible else { return }
+        guard !replaying,diagnosticWindow.isVisible else { return }
         if let rig = lastState?.eye_cameras {
             for (eye, view) in [("left", preview), ("right", secondaryEyePreview)] {
                 if rig.eyes[eye]?.connected == true { fetchPreview("\(eye).jpg", into: view) }
@@ -1715,7 +2252,7 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
                 ? data.flatMap(NSImage.init(data:)) : nil
             DispatchQueue.main.async {
                 self?.diagnosticPending.remove(path)
-                if self?.generation == frameGeneration { view?.image = image }
+                if self?.generation == frameGeneration && self?.replaying == false { view?.image = image }
             }
         }.resume()
     }
@@ -1745,10 +2282,75 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
         request("/blink-click", body: ["enabled": enabled]) { [weak self] error in self?.localError = error }
     }
     @objc func openRecordingReview() {
-        request("/recordings/open",body:[:]) { [weak self] error in
-            self?.localError = error
-            if error == nil { NSWorkspace.shared.open(URL(string:"http://127.0.0.1:8766/")!) }
+        showDiagnostics();recording.connect()
+    }
+    func setReplayMode(_ enabled:Bool) {
+        calibrationVoice.silence()
+        func editable(_ view:NSView) {
+            (view as? NSControl)?.isEnabled = !enabled
+            for child in view.subviews { editable(child) }
         }
+        editable(eyeSetupStack)
+        for control in [thresholdSlider,gazeEyes,clearEyeRegion] as [NSControl] { control.isEnabled = !enabled }
+        for slider in angleDebugger.sliders.values { slider.isEnabled = !enabled }
+        if enabled { liveSceneConfiguration=angleDebugger.replayConfiguration }
+        else {
+            angleDebugger.replayTime=nil
+            if let saved=liveSceneConfiguration { angleDebugger.applyReplayConfiguration(saved,cameraName:lastState?.head_camera?.name) }
+            liveSceneConfiguration=nil
+        }
+        generation+=1;clicksSuppressedUntil=Date().addingTimeInterval(1)
+        motion.reset();for side in ["left","right"] { eyeMotions[side]?.reset();eyeDots[side]?.orderOut(nil) }
+        dot.orderOut(nil);window.orderOut(nil);cursorReference.orderOut(nil)
+        preview.image=nil;secondaryEyePreview.image=nil;facePreview.image=nil;secondHeadPreview.image=nil
+        angleDebugger.resetReplayMeasurements()
+        if enabled {
+            diagnosticWindow.title="EyeCursor · Eye camera diagnostics · Replay"
+        } else {
+            diagnosticWindow.title="EyeCursor · Eye camera diagnostics"
+            if let state=lastState { render(state) };refreshDiagnosticFrame()
+        }
+        updateMenu()
+    }
+    func renderReplay(_ frame:ReplayFrame,images:[String:NSImage]) {
+        guard replaying else { return }
+        preview.image=images["left"];secondaryEyePreview.image=images["right"];facePreview.image=images["face"]
+        secondHeadPreview.image=images["face_secondary"]
+        setSecondHeadVisible(images["face_secondary"] != nil || frame.state?.head_camera?.second_view?.camera_id != nil)
+        func stamp(_ side:String)->String {
+            frame.camera_times[side].map { "Replay · \(DiagnosticRecordingController.time($0))" } ?? "No frame at this time"
+        }
+        secondHeadRate.stringValue=stamp("face_secondary")
+        diagnosticRate.stringValue=stamp("left");secondaryEyeStatus.stringValue=stamp("right");webcamRate.stringValue=stamp("face")
+        angleDebugger.resetReplayMeasurements()
+        angleDebugger.replayTime=frame.t_ms/1000
+        if let scene=frame.scene,!scene.isEmpty { angleDebugger.applyReplayConfiguration(scene,cameraName:frame.state?.head_camera?.name) }
+        trackingEyeTitle.stringValue=frame.state?.eye_cameras?.eyes["left"].map { "Left eye · \($0.rotation)°" } ?? "Left eye · Replay"
+        secondaryEyeTitle.stringValue=frame.state?.eye_cameras?.eyes["right"].map { "Right eye · \($0.rotation)°" } ?? "Right eye · Replay"
+        if let state=frame.state {
+            angleDebugger.update(state,at:frame.t_ms/1000)
+            calibrationSteps.update(state.onboarding)
+        }
+        var eyes:[String:([Double],Double)]=[:]
+        for side in ["left","right","combined"] {
+            let panel=side == "combined" ? dot : eyeDots[side]
+            guard let panel=panel else { continue }
+            guard let sample=frame.cursors[side],sample.point.count == 2,sample.point.allSatisfy({$0.isFinite}),
+                  sample.opacity>0,let primary=NSScreen.screens.first else { panel.orderOut(nil);continue }
+            let point=NSPoint(x:sample.point[0],y:primary.frame.maxY-sample.point[1])
+            // Recorded desktop coordinates are already fenced and eased. Do not
+            // infer a new gaze, smooth again, or move the operating-system cursor.
+            guard NSScreen.screens.contains(where:{$0.frame.contains(point)}) else { panel.orderOut(nil);continue }
+            panel.alphaValue=sample.opacity
+            panel.setFrameOrigin(NSPoint(x:point.x-panel.frame.width/2,y:point.y-panel.frame.height/2))
+            panel.orderFrontRegardless()
+            if side != "combined" { eyes[side]=(sample.point,sample.opacity) }
+        }
+        angleDebugger.followDisplayedEyes(eyes)
+        angleDebugger.followDisplayedCursor(frame.cursors["combined"]?.point,opacity:frame.cursors["combined"]?.opacity ?? 0)
+        angleDebugger.rebuild(at:frame.t_ms/1000)
+        if frame.state == nil { diagnosticText.stringValue="No saved scene at this time" }
+        updateMenu()
     }
     @objc func quitEyeCursor() { NSApp.terminate(nil) }
     func menuWillOpen(_ menu: NSMenu) {
@@ -1783,6 +2385,7 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
     }
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         if sender === diagnosticWindow {
+            if replaying { recording.returnLive() }
             angleDebugger.sceneView.isPlaying = false
             surface.monochrome = false
             diagnosticWindow.orderOut(nil)
@@ -1793,6 +2396,7 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
         return false
     }
     func applicationWillTerminate(_ notification: Notification) {
+        calibrationVoice.silence()
         quitting = true
         if let hotKey = cursorLearningHotKey { UnregisterEventHotKey(hotKey) }
         if let handler = cursorLearningKeyHandler { RemoveEventHandler(handler) }
@@ -1848,7 +2452,7 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
             defer { try? output.close() }
             let process = Process()
             process.executableURL = python
-            process.arguments = ["-u", script.path, "--native-host-pid", String(ProcessInfo.processInfo.processIdentifier)]
+            process.arguments = ["-u", script.path, "--port", String(port), "--native-host-pid", String(ProcessInfo.processInfo.processIdentifier)]
             process.currentDirectoryURL = root
             process.standardOutput = output
             process.standardError = output
@@ -1901,6 +2505,9 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
     }
 
     func animateCursor(at time: Double = ProcessInfo.processInfo.systemUptime) {
+        guard !replaying else { return }
+        presentedCursors=[:]
+        defer { recording.capture(presentedCursors,scene:angleDebugger.replayConfiguration,at:time) }
         // Draw the scene after publishing this frame's displayed cursor point.
         defer { angleDebugger.animate(at:time) }
         let combinedSample = motion.sample(at:time)
@@ -1912,6 +2519,7 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
                   let primary = NSScreen.screens.first else { eyeDots[side]?.orderOut(nil); continue }
             let opacity = eyeMotions[side]?.opacity ?? 0
             displayedEyes[side] = ([Double(center.x),Double(primary.frame.maxY-center.y)],opacity)
+            presentedCursors[side]=ReplayCursor(point:[Double(center.x),Double(primary.frame.maxY-center.y)],opacity:opacity)
             if angleDebugger.separateEyes.state == .on && !active && !eyeSetupPending && lastState?.calibrated == true && lastState?.desktop_cursor == true {
                 eyeDots[side]?.alphaValue = opacity
                 let radius = (eyeDots[side]?.frame.width ?? 18)/2
@@ -1938,6 +2546,7 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
         }
         if let primary = NSScreen.screens.first {
             angleDebugger.followDisplayedCursor([Double(center.x),Double(primary.frame.maxY-center.y)],opacity:motion.opacity)
+            presentedCursors["combined"]=ReplayCursor(point:[Double(center.x),Double(primary.frame.maxY-center.y)],opacity:motion.opacity)
         }
         dot.alphaValue = motion.opacity
         dot.setFrameOrigin(NSPoint(x: center.x - 8, y: center.y - 8))
@@ -1945,6 +2554,7 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
     }
 
     func animateCursorReference(mouse: NSPoint = NSEvent.mouseLocation) {
+        guard !replaying else { return }
         guard Date().timeIntervalSince(lastReply) <= 0.6 else {
             cursorReference.orderOut(nil); return
         }
@@ -1982,7 +2592,7 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
     }
 
     func animateCalibration() {
-        guard active, Date().timeIntervalSince(lastReply) <= 0.6 else { return }
+        guard !replaying,active, Date().timeIntervalSince(lastReply) <= 0.6 else { return }
         let now = ProcessInfo.processInfo.systemUptime
         if let flow = lastState?.onboarding, flow.screen_path == "quick",
            let start = flow.screen_path_started_at, start.isFinite {
@@ -1997,7 +2607,8 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
 
     func refresh() {
         guard getppid() == parentPID else { NSApp.terminate(nil); return }
-        if Date().timeIntervalSince(lastReply) > 0.6 {
+        if !replaying,Date().timeIntervalSince(lastReply) > 0.6 {
+            calibrationVoice.silence(reset:false)
             angleDebugger.invalidate()
             readoutMotion.reset()
             clicksSuppressedUntil = Date().addingTimeInterval(1)
@@ -2024,18 +2635,19 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 self.pending = false
-                guard let state = state else { self.loseCursorTracking(); return }
+                guard let state = state else { if !self.replaying { self.loseCursorTracking() }; return }
                 self.lastReply = Date()
                 self.lastState = state
                 if state.onboarding != nil && !self.displaysRegistered { self.registerDisplays() }
-                if !self.changing && self.generation == generation { self.render(state) }
-                self.processPendingPreviewAlignment()
+                if !self.replaying && !self.changing && self.generation == generation { self.render(state) }
+                if !self.recording.initialized && !self.recording.connecting { self.recording.connect() }
+                if !self.replaying { self.processPendingPreviewAlignment() }
             }
         }.resume()
     }
 
     func animateMeasurements() {
-        guard diagnosticWindow.isVisible, Date().timeIntervalSince(lastReply) <= 0.6,
+        guard !replaying,diagnosticWindow.isVisible, Date().timeIntervalSince(lastReply) <= 0.6,
               let state = lastState else { return }
         let time = ProcessInfo.processInfo.systemUptime
         renderMeasurements(state, at: time)
@@ -2058,13 +2670,15 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
             rateLabel.addAttribute(.foregroundColor, value: NSColor.systemGreen, range: numberRange)
         }
         if let rig = state.eye_cameras {
-            diagnosticRate.stringValue = Self.eyeRate(rig.eyes["left"])
+        diagnosticRate.stringValue = Self.eyeRate(rig.eyes["left"])
             secondaryEyeStatus.stringValue = Self.eyeRate(rig.eyes["right"])
         } else { diagnosticRate.attributedStringValue = rateLabel }
         webcamRate.stringValue = state.head_camera.map { String(format: "Webcam %.0f FPS", readoutMotion.sample("webcamFPS", at: time)?.first ?? $0.fps) } ?? ""
     }
 
     func render(_ state: TrackerState) {
+        guard !replaying else { return }
+        calibrationVoice.update(state.onboarding)
         renderEyeSetup(state.eye_cameras)
         renderSecondHead(state.head_camera?.second_view)
         sampleSystemCursor(state)
@@ -2145,7 +2759,7 @@ final class CalibrationApp: NSObject, NSApplicationDelegate, NSWindowDelegate, N
 
 let arguments = Array(CommandLine.arguments.dropFirst()).filter { !$0.hasPrefix("-psn_") }
 let standalone = arguments.isEmpty
-let port = standalone ? 8765 : (Int(arguments[0]) ?? 0)
+let port = standalone ? availableTrackerPort() : (Int(arguments[0]) ?? 0)
 guard (1...65535).contains(port), standalone || (arguments.count <= 2 &&
       (arguments.count == 1 || arguments[1] == "--hybrid")) else {
     fputs("Usage: EyeCursor [PORT [--hybrid]]\n", stderr)

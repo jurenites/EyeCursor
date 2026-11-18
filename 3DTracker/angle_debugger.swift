@@ -263,6 +263,7 @@ final class AngleDebugger: NSObject, SCNSceneRendererDelegate {
         rawDirections.state = .on
         rawDirections.target = self; rawDirections.action = #selector(changed)
         add(rawDirections)
+        separateEyes.state = .on
         add(separateEyes)
         // Live samples may disappear between frames. Keep the controls below
         // these labels stationary regardless of text wrapping or availability.
@@ -534,6 +535,21 @@ final class AngleDebugger: NSObject, SCNSceneRendererDelegate {
     func animate(at time: Double = ProcessInfo.processInfo.systemUptime) {
         if contentView.window?.isVisible == true { rebuild(at: time) }
     }
+    var replayTime:Double?
+    var replayConfiguration:[String:Double] {
+        var result=sliders.mapValues { $0.doubleValue }
+        result["_referenceWidth"]=sceneReferenceWidth
+        return result
+    }
+    func applyReplayConfiguration(_ configuration:[String:Double],cameraName:String?) {
+        for (key,value) in configuration where value.isFinite { sliders[key]?.doubleValue=value }
+        sceneReferenceWidth=configuration["_referenceWidth"];sceneReferenceCamera=cameraName
+    }
+    func resetReplayMeasurements() {
+        state=nil;measurements.reset();cameraMeasurements.reset()
+        displayedMeasurements=[:];displayedEyes=[:];displayedCursor=nil
+        savedReferences=[];lastMetricRows=Array(repeating:nil,count:5)
+    }
     func invalidate() {
         state = nil
         displayedCursor = nil
@@ -571,6 +587,7 @@ final class AngleDebugger: NSObject, SCNSceneRendererDelegate {
         for (key,label) in values { label.stringValue = String(format: "%@: %.1f",label.identifier!.rawValue, value(key)) }
         sliders["tx"]?.isEnabled = targetMode.state != .on || calibrationTarget() == nil
         sliders["ty"]?.isEnabled = sliders["tx"]?.isEnabled ?? true
+        if replayTime != nil { for slider in sliders.values { slider.isEnabled=false } }
     }
     @objc func changed() {
         saveSettings()
@@ -600,12 +617,14 @@ final class AngleDebugger: NSObject, SCNSceneRendererDelegate {
         let mount = simd_quatf(angle:value("camera_pitch") * .pi/180,axis:SIMD3<Float>(1,0,0))
         // A captured reference must not straighten a physically turned head.
         let rotation = mount * AngleGeometry.headRotation(features,relativeTo: [0,0,0,0,0,0])
-        let midpoint = AngleGeometry.eyeMidpoint(imageUV:[Float(features[3]),Float(features[4])],depth:depth,
+        let eyeOffset = rotation.act([0,2,-5.8])
+        let eyeDepth = max(5,depth + mount.inverse.act(eyeOffset).z)
+        let midpoint = AngleGeometry.eyeMidpoint(imageUV:[Float(features[3]),Float(features[4])],depth:eyeDepth,
             verticalFOV:value("camera_fov") * .pi/180,imageAspect:Float(state?.head_camera?.image_aspect ?? 16.0/9.0),
             cameraOrigin:[value("hx"),value("width")/aspect/2+value("webcam")+value("hy"),0],
             cameraPitch:value("camera_pitch") * .pi/180)
         // The observed landmarks are the eye midpoint, not the skull center.
-        let head = midpoint-rotation.act([0,2,-5.8])
+        let head = midpoint-eyeOffset
         return (head,rotation)
     }
     func referenceEyeOrigin(_ features: [Double]) -> SIMD3<Float> {
@@ -833,7 +852,7 @@ final class AngleDebugger: NSObject, SCNSceneRendererDelegate {
             title = "Guide: closer / farther, face level"
             line(anchor-[0,0,4],anchor+[0,0,4],alpha:0.55,radius:0.07,color:.systemTeal,name:"head-guide-depth-axis")
         case "shift":
-            position.x += 4*wave
+            position.x -= 4*wave
             title = "Guide: slide sideways, face forward"
             line(anchor-[4,0,0],anchor+[4,0,0],alpha:0.55,radius:0.07,color:.systemTeal,name:"head-guide-shift-axis")
         case "pitch":
@@ -863,7 +882,8 @@ final class AngleDebugger: NSObject, SCNSceneRendererDelegate {
         label.constraints = [SCNBillboardConstraint()]
     }
 
-    func rebuild(at time: Double = ProcessInfo.processInfo.systemUptime) {
+    func rebuild(at suppliedTime: Double = ProcessInfo.processInfo.systemUptime) {
+        let time=replayTime ?? suppliedTime
         if state?.onboarding?.phase != "motion" { motionGuideAnchor = nil; motionGuideCue = nil }
         metrics.isHidden = rawDirections.state != .on
         updateLabels()
@@ -932,6 +952,12 @@ final class AngleDebugger: NSObject, SCNSceneRendererDelegate {
         let eyeRadius: CGFloat = 1.2
         let skull = ball(head,1,alpha: 0.12,wire: true); skull.simdScale = [7.7,10,7]; skull.simdOrientation = rotation
         skull.name = "tracked-head"
+        // Ear-level local origin makes the rotation center legible. These are
+        // schematic ears, not extra detected landmarks.
+        for sign: Float in [-1,1] {
+            let ear=ball(head+rotation.act([sign*7.4,0,0]),1,alpha:0.18,wire:true)
+            ear.simdScale=[0.45,1.4,0.8];ear.simdOrientation=rotation;ear.name="tracked-ear"
+        }
         let other = head+rotation.act([-trackingEyeSign*eyeSeparation()/2+value("cx"),2+value("cy"),-5.8+value("cz")]); _ = ball(other,eyeRadius,alpha: 0.19,wire: true)
         let nominal = head+rotation.act([trackingEyeSign*eyeSeparation()/2,2,-5.8])
         let eye = nominal+rotation.act([value("cx"),value("cy"),value("cz")]); lastEye = eye

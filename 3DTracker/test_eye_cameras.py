@@ -36,6 +36,23 @@ class EyeCameraTests(unittest.TestCase):
     def publish(self, eye, frame=None):
         self.rig._publish(eye, self.rig.config[eye], self.frame if frame is None else frame, self.now)
 
+    def test_fixed_preference_does_not_freeze_an_empty_model(self):
+        detector=independent_detector()
+        calibration=Calibration('Left eye camera')
+        self.rig.set_fixed_eye_sphere('left',True)
+        self.rig.apply_eye_sphere_setting('left',detector,calibration.eye_model)
+        self.assertTrue(detector.eye_sphere_adjustment_enabled)
+        # The first geometric fit must not freeze collection before the
+        # readiness check has enough stable estimates to complete calibration.
+        detector.last_sphere_fit={'radius_px':100}
+        detector.model_centers=[(320,240)]*30
+        calibration.eye_model.start()
+        self.rig.apply_eye_sphere_setting('left',detector,calibration.eye_model)
+        self.assertTrue(detector.eye_sphere_adjustment_enabled)
+        calibration.eye_model.phase='ready'
+        self.rig.apply_eye_sphere_setting('left',detector,calibration.eye_model)
+        self.assertFalse(detector.eye_sphere_adjustment_enabled)
+
     def test_fixed_sphere_preserves_live_model_frames_and_calibration(self):
         calibration = Calibration('Left eye camera')
         calibration.eye_cameras = self.rig
@@ -43,6 +60,8 @@ class EyeCameraTests(unittest.TestCase):
         detector = independent_detector()
         detector.prev_model_center_avg = (310, 230)
         detector.max_observed_distance = 42
+        detector.last_sphere_fit = {'radius_px':42}
+        detector.model_centers = [(310,230)]*30
         detector.ray_lines = ['existing ray']
         calibration.eye_model.start()
         self.publish('left')
@@ -53,6 +72,8 @@ class EyeCameraTests(unittest.TestCase):
         self.assertFalse(detector.eye_sphere_adjustment_enabled)
         self.assertEqual(detector.prev_model_center_avg, (310, 230))
         self.assertEqual(detector.max_observed_distance, 42)
+        self.rig.apply_eye_sphere_setting('left', detector, calibration.eye_model, force_collecting=True)
+        self.assertTrue(detector.eye_sphere_adjustment_enabled, 'The eye sweep collects despite a saved fixed preference')
         self.assertEqual(detector.ray_lines, ['existing ray'])
         self.assertEqual(self.rig.revisions, revision)
         self.assertEqual(self.rig.snapshot('left')['serial'], sample['serial'])
@@ -86,7 +107,7 @@ class EyeCameraTests(unittest.TestCase):
     def test_companion_fixed_sphere_toggle_does_not_reset_its_estimate(self):
         calibration = Calibration('Left eye camera')
         calibration.eye_cameras = self.rig
-        detector = Mock()
+        detector = Mock(last_sphere_fit={'radius_px':100},model_centers=[(320,240)]*30,min_model_centers=30)
         detector.get_last_tracking_result.return_value = None
         worker = CompanionEyeTracker(calibration, lambda frame, result, **kwargs: frame, detector)
         self.publish('right')
@@ -304,7 +325,7 @@ class EyeCameraTests(unittest.TestCase):
     def test_second_eye_detects_without_primary_and_rejects_old_results(self):
         calibration = Calibration('Left eye camera')
         calibration.eye_cameras = self.rig
-        detector = Mock()
+        detector = Mock(last_sphere_fit={'radius_px':100},model_centers=[(320,240)]*30,min_model_centers=30)
         detector.get_last_tracking_result.return_value = {
             'pupil_ellipse': {'center': [320, 240], 'axes': [80, 64], 'angle_degrees': 20},
             'confidence': .9, 'gaze_direction': [0, 0, 1]}
@@ -378,7 +399,7 @@ class EyeCameraTests(unittest.TestCase):
 
     def test_companion_has_its_own_frozen_model_and_preview_arrow_readiness(self):
         calibration=Calibration('Left eye camera');calibration.eye_cameras=self.rig
-        detector=Mock();detector.get_last_tracking_result.return_value=None
+        detector=Mock(last_sphere_fit={'radius_px':100},model_centers=[(320,240)]*30,min_model_centers=30);detector.get_last_tracking_result.return_value=None
         render=Mock(side_effect=lambda frame,result,**kwargs:frame)
         worker=CompanionEyeTracker(calibration,render,detector)
         self.publish('right');worker.process_next()
@@ -396,7 +417,7 @@ class EyeCameraTests(unittest.TestCase):
         calibration.head_camera = Mock()
         pose = {'features': [0., 0., 0., .5, .4, -1.2]}
         calibration.head_camera.sample_at.return_value = pose
-        detector = Mock()
+        detector = Mock(last_sphere_fit={'radius_px':100},model_centers=[(320,240)]*30,min_model_centers=30)
         detector.get_last_tracking_result.return_value = {
             'pupil_ellipse': {'center': [320, 240], 'axes': [80, 64], 'angle_degrees': 0},
             'confidence': .9, 'gaze_direction': [0, 0, 1], 'eye_model_estimated': True}

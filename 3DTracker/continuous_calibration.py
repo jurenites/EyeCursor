@@ -16,6 +16,30 @@ def fit_head_candidate(*args,**kwargs):
         model.fit_metrics["geometric_rejection"]=str(error)
         return model
 
+def check_recorded_head_movement(base,head_fit,seeds,rows,aspect,camera_aspect,side,started,single_pass=False):
+    """Fit the first motion cycle, check the untouched second cycle off-thread."""
+    run=ContinuousTargetCalibration(base,head_fit,seeds,aspect,camera_aspect,started,eye_side=side)
+    run.enable_guided(started)
+    run.training_snapshot=[r for r in rows if started<=r[0]<started+32]
+    run.validation=[r for r in rows if started+32<=r[0]<started+64]
+    if single_pass:
+        # Reserve the latter part of EACH movement, with a temporal gap. The
+        # solver never sees these labels; no second movement cycle is needed.
+        run.training_snapshot=[r for r in rows if 0<=r[0]-started<32 and (r[0]-started)%8<3.5]
+        run.validation=[r for r in rows if 0<=r[0]-started<32 and 4.25<=(r[0]-started)%8<7.75]
+    run.total_samples=len(rows);run.samples=list(run.training_snapshot)
+    try:
+        if len(run.training_snapshot)<run.MIN_SAMPLES:
+            raise ValueError('Too few clear eye/head samples in the first movement cycle')
+        run.candidate=fit_head_candidate(base,head_fit,seeds,run.training_snapshot,aspect,camera_aspect,side,robust=True)
+        run.fit_metrics=dict(run.candidate.fit_metrics, validation_protocol="within_motion_held_out_blocks" if single_pass else "second_motion_cycle")
+        run._check(started+(32 if single_pass else 64))
+    except (ValueError,np.linalg.LinAlgError) as error:
+        run.last_fit_error=str(error);run.fit_failures+=1
+        run.message='Eye/head fit rejected; the five-dot map is kept.'
+    run.pause(started+(32 if single_pass else 64))
+    return run
+
 
 
 def pupil_shape_rejection(result):
@@ -40,7 +64,7 @@ def pupil_shape_rejection(result):
 class ContinuousTargetCalibration:
     continuous=True
     GUIDED_MOTIONS=(('shift','Slide sideways'),('depth','Closer / farther'),('pitch','Nod'),('yaw','Turn'))
-    GUIDED_SEGMENT_SECONDS=4.
+    GUIDED_SEGMENT_SECONDS=8.
     CHECK_SECONDS=4.
     MIN_SAMPLES=60
     MIN_SECONDS=8.
@@ -58,6 +82,8 @@ class ContinuousTargetCalibration:
         self.guided_started=None
         self.checked_motion={'rotation':False,'translation':False}
         self.validation_diagnostics={}
+        self.check_rejection_reasons=[]
+        self.checked_candidate=None
         self.message='Watch the center dot; move your head naturally. Stop when you want.'
         self.next_fit=now+self.MIN_SECONDS;self.validation_started=None
         self.executor=executor;self.future=None;self.training_snapshot=[]
@@ -105,7 +131,7 @@ class ContinuousTargetCalibration:
 
     def observe(self,observation,stamp,now):
         self.accepted=False;self.last_capture=None
-        self.tick(now)
+        self.tick(now, start_fit=False)
         if self.paused_elapsed is not None:return
         if observation is None:self.rejected+=1;return
         if (self.last_stamp is not None and stamp<=self.last_stamp) or not 0<=now-stamp<=.15:return
@@ -119,6 +145,7 @@ class ContinuousTargetCalibration:
         self.total_samples+=1;self.last_capture=(kind,sample)
         # Full evidence is journaled by the owner; solver work/memory remain bounded.
         self.samples=[s for s in self.samples if now-s[0]<=120][-3600:]
+        self.tick(now)
 
     def _retry(self,now,message):
         # A failed model is not a failed observation. These explicitly labeled
@@ -131,7 +158,7 @@ class ContinuousTargetCalibration:
         self.phase='collect';self.candidate=None;self.validation=[]
         self.next_fit=now+self.RETRY_SECONDS;self.message=message
 
-    def tick(self,now):
+    def tick(self,now,start_fit=True):
         if self.paused_elapsed is not None:return
         if self.phase=='fitting' and self.future is not None and self.future.done():
             try:
@@ -145,10 +172,9 @@ class ContinuousTargetCalibration:
                 self.message='Keep watching and moving naturally; checking fresh measurements.'
         if self.phase=='validate' and now-self.validation_started>=self.CHECK_SECONDS:
             self._check(now)
-        if self.phase!='collect' or now<self.next_fit:return
+        if not start_fit or self.phase!='collect' or now<self.next_fit:return
         # Check readiness promptly; the retry backoff belongs to failed fits,
         # not an initial capture that is a fraction of a second short.
-        self.next_fit=now+.25
         if (len(self.samples)<self.MIN_SAMPLES or now-self.samples[-1][0]>.25
                 or self.samples[-1][0]-self.samples[0][0]<self.MIN_SECONDS):
             self.message='Keep watching the dot; collecting clear paired eye/head measurements.';return
@@ -162,7 +188,11 @@ class ContinuousTargetCalibration:
 
     def _check(self,now):
         rows=self.validation
+        self.checked_candidate=self.candidate
+        self.check_rejection_reasons=[]
         if len(rows)<15 or rows[-1][0]-rows[0][0]<2 or not any(motion_coverage(rows).values()):
+            self.validation_diagnostics={'samples':len(rows)}
+            self.check_rejection_reasons=['Too few independent checking samples or no measured head movement']
             self.check_failures+=1;self._retry(now,'Check needs clearer head movement; keep watching and moving.');return
         errors=[];old_errors=[];outside_support=0;missing=0
         for _,eye,pose,target in rows:
@@ -193,6 +223,7 @@ class ContinuousTargetCalibration:
                   and np.median(errors)<=np.median(old_errors)
                   and np.percentile(errors,95)<=np.percentile(old_errors,95)) if empirical else (
                   self.validation_error<=.06 and self.validation_error<=max(.015,self.baseline_error*.85))
+        if not improved:self.check_rejection_reasons.append('Overall checking error or error tail did not improve enough')
         if self.guided_started is not None:
             per_motion={}
             for key,_ in self.GUIDED_MOTIONS:
@@ -209,6 +240,9 @@ class ContinuousTargetCalibration:
                 per_motion[key]={'samples':len(indices),'movement_observed':bool(moved),
                                  'head_feature_span':span.tolist(),
                                  'error_p80_uv':error,'baseline_p80_uv':before,'accepted':bool(accepted)}
+                if not accepted:
+                    self.check_rejection_reasons.append(f'{key}: insufficient observations/movement' if len(indices)<10 or not moved else
+                        f'{key}: error {error:.4f} UV; limit {(.30 if empirical else .06):.2f}, previous {before:.4f}')
             self.validation_diagnostics['per_motion']=per_motion
             improved=improved and all(value['accepted'] for value in per_motion.values())
         if not improved:
@@ -236,6 +270,9 @@ class ContinuousTargetCalibration:
                 'last_fit_error':self.last_fit_error,'applied_updates':self.revision,
                 'fit_metrics':self.fit_metrics,'progress':self.progress(now),
                 'validation_diagnostics':self.validation_diagnostics,
+                'check_rejection_reasons':self.check_rejection_reasons,
+                'fitted_training_samples':len(self.training_snapshot),
+                'evaluated_checking_samples':self.validation_diagnostics.get('samples',0),
                 'motion_cue':self.motion_cue(now),
                 'validation_error_uv':self.validation_error,'baseline_error_uv':self.baseline_error,
                 'applied':self.applied,'motion_hint':'free','checked_motion':self.checked_motion,

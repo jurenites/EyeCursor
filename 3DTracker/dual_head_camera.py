@@ -18,13 +18,14 @@ SCALE = np.array([.14, .14, .18, .04, .04, .12])
 
 class ViewAlignment:
     def __init__(self):
-        self.rows = deque(maxlen=1800)
+        self.rows = deque(maxlen=6000)
         self.collecting = False
         self.model = None
         self.last_key = None
         self.bad_keys = set()
         self.message = 'Select a second webcam, then learn its view before gaze calibration.'
         self.validation_error = None
+        self.validation_details = None
 
     def begin(self):
         self.__init__()
@@ -43,12 +44,21 @@ class ViewAlignment:
         if p.shape == s.shape == (6,) and np.isfinite(np.r_[p, s]).all():
             self.rows.append((secondary['time'], p, s))
 
-    def finish(self):
+    def finish(self, split_time=None, started_at=None):
         if len(self.rows) < 80 or self.rows[-1][0] - self.rows[0][0] < 20:
             raise ValueError('Keep moving slowly: need 80 distinct paired frames over at least 20 seconds.')
         p = np.array([r[1] for r in self.rows]) / SCALE
         s = np.array([r[2] for r in self.rows]) / SCALE
-        split = int(len(s) * .75)
+        split = int(len(s) * .75) if split_time is None else int(np.searchsorted([r[0] for r in self.rows], split_time))
+        if split < 40 or len(s)-split < 20:
+            raise ValueError('Too few paired webcam frames in learning or checking. Keep both faces visible and retry.')
+        if started_at is not None:
+            # Each half must contain a complete motion cycle, not a random split
+            # of adjacent frames or a validation interval containing only turns.
+            for index in range(8):
+                stamps=[r[0] for r in self.rows if started_at+index*8 <= r[0] < started_at+(index+1)*8]
+                if len(stamps)<6 or stamps[-1]-stamps[0]<4:
+                    raise ValueError('A movement interval lost paired face frames. Keep both faces visible and retry webcam alignment.')
         # A later, untouched time interval validates the mapping. Repeated motion
         # is intentional: random frame splits would leak near-identical samples.
         center = np.mean(s[:split], axis=0)
@@ -64,6 +74,11 @@ class ViewAlignment:
         prediction = design[split:] @ coef
         error = float(np.percentile(np.max(np.abs(prediction - p[split:]), axis=1), 90))
         baseline = float(np.mean((p[split:] - np.mean(p[:split], axis=0))**2))
+        self.validation_details = dict(training_samples=split,checking_samples=len(s)-split,rank=rank,
+            p90_error_native_units=(np.percentile(np.abs(prediction-p[split:]),90,axis=0)*SCALE).tolist(),
+            units=['yaw_rad','pitch_rad','roll_rad','image_u','image_v','log_face_width'],
+            mean_squared_normalized_error=float(np.mean((prediction-p[split:])**2)),
+            constant_pose_baseline_error=baseline)
         if error > .35 or baseline < .015 or np.mean((prediction - p[split:])**2) > baseline * .6:
             raise ValueError('Views did not agree on the later movements. Keep both cameras fixed and repeat slow movements.')
         # Do not refit on validation rows. Reject extrapolation and unseen motion.
@@ -160,7 +175,7 @@ class DualHeadCamera:
     def start(self):
         self.primary.start()
         if self.selected_id:
-            self.secondary = self.factory(self.enumerate_cameras, self.selected_id, isolated=True)
+            self.secondary = self.factory(self.enumerate_cameras, self.selected_id, isolated=True, recording_stream='face_secondary')
             self.secondary.start()
         self.thread = threading.Thread(target=self._run, name='second-head-alignment', daemon=True)
         self.thread.start()
@@ -172,7 +187,7 @@ class DualHeadCamera:
                 return
             if device_id and device_id not in {d['id'] for d in self.devices}:
                 raise ValueError('Choose an available face webcam')
-            new = self.factory(self.enumerate_cameras, device_id, isolated=True) if device_id else None
+            new = self.factory(self.enumerate_cameras, device_id, isolated=True, recording_stream='face_secondary') if device_id else None
             temporary = self.path.with_suffix('.tmp')
             self.path.parent.mkdir(parents=True, exist_ok=True)
             temporary.write_text(json.dumps({'secondary_camera_id': device_id}) + '\n')
@@ -187,13 +202,16 @@ class DualHeadCamera:
                 new.start()
 
     def _reset(self, message):
+        changed_features = self.alignment.model is not None
         self.alignment = ViewAlignment()
         self.alignment.message = message
         self.last_output = None
         self.last_assistance = {'reason': 'not_aligned', 'weight': 0.}
-        self.revision += 1
+        # Reconnecting an unused second camera does not change the laptop's
+        # feature coordinates and must not erase otherwise valid eye maps.
+        if changed_features:self.revision += 1
 
-    def learn(self, finish=False):
+    def learn(self, finish=False, split_time=None, started_at=None):
         with self.lock:
             if not self.secondary:
                 raise ValueError('Select a second webcam first')
@@ -201,12 +219,38 @@ class DualHeadCamera:
             if finish:
                 if not self.alignment.collecting:
                     raise ValueError('Start learning the second view first')
-                self.alignment.finish()
+                self.alignment.finish(split_time=split_time, started_at=started_at)
                 self.revision += 1
                 self.last_output = None
             else:
                 self._reset('')
                 self.alignment.begin()
+
+    def stop_learning(self):
+        with self.lock:
+            self.alignment.collecting = False
+
+    def alignment_report(self):
+        with self.lock:
+            return dict(validation=self.alignment.validation_details,
+                        samples=[dict(time=t,primary=p.tolist(),secondary=s.tolist())
+                                 for t,p,s in self.alignment.rows])
+
+    def reproject_sample(self, sample):
+        """Re-express a saved fixation through the newly learned feature source.
+
+        Uses the actual paired exposure, not the user's current pose. A pure
+        copy of the alignment avoids changing its live disagreement counters.
+        """
+        from copy import copy
+        with self.lock:
+            current=dict(sample,features=list(sample.get('primary_features',sample['features'])),epoch=self.epoch)
+            secondary=sample.get('secondary_sample')
+            paired=sample.get('paired_primary_sample')
+            if secondary and paired and self.alignment.model is not None:
+                alignment=copy(self.alignment);alignment.bad_keys=set()
+                current,_,_=alignment.assist(current,paired,secondary)
+            return current
 
     def _check_session(self):
         session = (self.primary.epoch, self.secondary.epoch if self.secondary else None)
@@ -245,9 +289,15 @@ class DualHeadCamera:
             if p is None or p['epoch'] != self.primary.epoch:
                 return None  # Never invent a reference pose when the primary is lost.
             p = dict(p, epoch=self.epoch)
+            primary_features = list(p['features'])
+            secondary_sample = self.secondary.sample_at(p['time']) if self.secondary else None
+            paired = self.primary.sample_at(secondary_sample['time']) if secondary_sample else None
+            if secondary_sample and (abs(secondary_sample['time']-stamp)>PAIR_MAX_SECONDS or
+                                     not 0<=self.clock()-secondary_sample['time']<=FACE_MAX_SECONDS):
+                secondary_sample=None;paired=None
             weight, reason = 0., 'not_aligned' if self.secondary else 'disabled'
             if self.secondary and self.alignment.model is not None:
-                s = self.secondary.sample_at(p['time'])
+                s = secondary_sample
                 # Both pairing to the primary AND pairing to the IR observation
                 # must be fresh; their skews must not accumulate.
                 paired = self.primary.sample_at(s['time']) if s else None
@@ -261,6 +311,11 @@ class DualHeadCamera:
                     reason = 'second_view_stale'
             self.last_assistance = {'reason': reason, 'weight': round(weight, 3), 'time': p['time']}
             p['secondary_view'] = dict(self.last_assistance)
+            # Preserve inputs alongside the output so a recording can explain
+            # which camera correction (or fallback) produced each gaze sample.
+            p['primary_features'] = primary_features
+            p['secondary_sample'] = secondary_sample
+            p['paired_primary_sample'] = paired
             self.last_output = p
             return p
 
@@ -279,7 +334,9 @@ class DualHeadCamera:
                 'devices': self.devices, 'error': self.error,
                 'collecting': self.alignment.collecting, 'aligned': self.alignment.model is not None,
                 'samples': len(self.alignment.rows), 'message': self.alignment.message,
+                'last_sample_time': self.alignment.rows[-1][0] if self.alignment.rows else None,
                 'validation_error_normalized': self.alignment.validation_error,
+                'validation': self.alignment.validation_details,
                 'method': 'empirical_pose_alignment', 'metric_triangulation': False,
                 'assistance': assistance}
             return result

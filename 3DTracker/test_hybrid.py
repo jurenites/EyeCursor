@@ -173,6 +173,40 @@ class FakeHead:
 
 
 class HybridFlowTests(unittest.TestCase):
+    def test_native_guidance_captures_left_then_right_preview_before_five_dots(self):
+        current={}
+        self.c.eye_cameras=SimpleNamespace(
+            config={s:{'device_id':s} for s in ('left','right')},
+            context=lambda:('left','left',180),observations_at=lambda *args,**kwargs:current,
+            status=lambda:{'eyes':{}})
+        self.addCleanup(lambda:setattr(self.c,'eye_cameras',None))
+        self.flow.arm(start=True,preview_alignment=True)
+        for _ in range(25):self.feed()
+        self.assertEqual(self.flow.phase,'preview')
+        self.assertFalse(self.flow.state()['eye_scan_enabled'])
+        for side in ('left','right'):
+            self.assertEqual(self.flow.preview_reference.eye,side)
+            self.flow.set_preview_target(side,[.2,.3]);start=self.now
+            while self.now-start<6.1:
+                self.now+=.05
+                current={side:dict(time=self.now,eye=[.4,.5],head=BASE.tolist())}
+                self.flow.update_preview_reference(self.now)
+                if self.flow.preview_reference.eye!=side:break
+        self.assertEqual(self.flow.phase,'head')
+        self.assertEqual(len(self.flow.preview_seeds('left')),1)
+        self.assertEqual(len(self.flow.preview_seeds('right')),1)
+        self.assertIsNone(self.flow.mapping,'Preview alignment must not fabricate a screen map')
+
+    def test_native_head_guidance_is_one_pass_then_background_fit(self):
+        self.finish();self.flow.preview_guided=True
+        self.flow.start_head_refinement(guided=True)
+        start=self.now
+        self.assertEqual(self.flow.guided_motion_deadline(),start+32)
+        self.assertEqual(self.flow.head_refinement.next_fit,float('inf'))
+        with patch.object(self.flow,'fit_single_pass') as fit:
+            self.flow.update_head_refinement(start+31.9);fit.assert_not_called()
+            self.flow.update_head_refinement(start+32.01);fit.assert_called_once()
+
     def setUp(self):
         from test_continuous_calibration import ImmediateExecutor
         executor=patch('continuous_calibration.ThreadPoolExecutor',side_effect=lambda **kw:ImmediateExecutor())
@@ -198,9 +232,141 @@ class HybridFlowTests(unittest.TestCase):
         self.c.add_frame(result)
 
     def start_head(self):
+        from hybrid_onboarding import ORBIT_SECONDS
         for _ in range(30):self.feed()
+        if self.flow.phase=='fitting':
+            self.now+=ORBIT_SECONDS
+            self.flow.tick(self.now)
         self.assertEqual(self.flow.phase,'head')
         self.now+=.6
+
+    def test_two_webcam_flow_starts_with_dots_then_one_movement_recording(self):
+        from unittest.mock import MagicMock
+        from dual_head_camera import DualHeadCamera, SCALE
+        primary=HeadCamera(lambda:[],'built');secondary=HeadCamera(lambda:[],'fhd')
+        primary.epoch=secondary.epoch=1
+        with tempfile.TemporaryDirectory() as tmp:
+            rig=DualHeadCamera(primary,lambda:[],Path(tmp)/'head.json',clock=lambda:self.now)
+            rig.selected_id='fhd';rig.secondary=secondary
+            self.flow.head_camera=rig
+            self.flow.arm(start=False)
+            self.assertEqual(self.flow.phase,'idle')
+            self.flow.arm(start=True)
+            self.assertEqual(self.flow.phase,'waiting')
+            self.assertFalse(rig.alignment.collecting)
+            self.assertFalse(self.flow.state()['eye_scan_enabled'])
+            self.flow.mapping=FivePointMap(np.array(TARGETS)*[.18,.14]+[.38,.35])
+            self.flow.start_view_alignment()
+            self.flow.stop_step()
+            self.assertEqual(self.flow.stopped_stage,'views')
+            self.assertFalse(rig.alignment.collecting)
+            self.flow.retry_step()
+            self.now=102.
+            with patch.object(self.flow,'rebase_screen_references') as rebase,patch.object(self.flow,'fit_recorded_movement') as fit:
+                for t in np.arange(102,166,.05):
+                    local=(t-102)%32;axis=int(local//8)
+                    features=BASE.copy();features[axis]+=.7*SCALE[axis]*np.sin(local%8*np.pi/4)
+                    p={'features':(features+.1*SCALE).tolist(),'epoch':1,'time':float(t)}
+                    primary.history.append({'time':float(t),'epoch':1,'pose':{'features':p['features']}})
+                    rig.alignment.add(p,dict(p,features=features.tolist()))
+                    self.now=float(t);self.flow.tick(self.now)
+                self.now=166.01;self.flow.tick()
+                rebase.assert_called_once();fit.assert_called_once()
+            self.assertIsNotNone(rig.alignment.model)
+            self.flow.guided_motion_outcome='applied'
+            self.flow.finish_guided_calibration()
+            self.assertEqual(self.flow.phase,'verify')
+            self.flow.arm(start=True);self.flow.start_view_alignment()
+            self.now+=20.1;self.flow.tick()
+            self.assertEqual(self.flow.phase,'paused')
+            self.assertIn('No synchronized',self.flow.blocker)
+
+    def test_shared_movement_capture_finishes_without_another_head_exercise(self):
+        from test_geometric_gaze import fixture,physical_eye,moving_head,ASPECT
+        base,fit,seeds=fixture()
+        self.flow.mapping=base;self.flow.head_fit=fit;self.flow.two_view_guided=True
+        self.flow.views_started=100.;self.now=164.
+        self.flow.head_camera=SimpleNamespace(epoch=1,reproject_sample=lambda sample:sample,
+            status=lambda now:{'image_aspect':16/9})
+        self.flow.views_observations={'right':[]}
+        for t in np.arange(0,64,.1):
+            head=moving_head(t)
+            self.flow.views_observations['right'].append(dict(time=100+t,
+                eye=physical_eye([.5,.5],head).tolist(),head_sample={'features':head.tolist()}))
+        with patch.object(self.flow,'geometry_seeds',return_value=seeds):
+            self.flow.fit_recorded_movement()
+        try:
+            self.assertEqual(self.flow.phase,'views_fit')
+            self.flow.views_future.result(timeout=15)
+            self.flow.finish_recorded_movement(self.now)
+            self.assertEqual(self.flow.phase,'verify')
+            self.assertEqual(self.flow.guided_motion_outcome,'applied')
+            self.assertIsNot(self.flow.mapping,base)
+            self.assertFalse(self.flow.cursor_calibration.active)
+        finally:self.flow.close()
+
+    def test_saved_five_targets_are_rebased_for_both_eyes_without_moving_targets(self):
+        from dot_learning import TargetCapture
+        shift=np.array([.01,.02,0,.001,0,0])
+        self.flow.head_camera=SimpleNamespace(epoch=9,reproject_sample=lambda sample:dict(sample,features=(np.array(sample['features'])+shift).tolist()))
+        self.flow.calibration_rays=[];self.flow.onboarding_windows=[]
+        self.flow.binocular.rows={'left':[],'right':[]}
+        for index,target in enumerate(TARGETS):
+            capture=TargetCapture(100+index)
+            window=(100+index,100+index+.45);self.flow.onboarding_windows.append(window)
+            if index==0:self.flow.center_capture_window=window
+            for side in ('left','right'):
+                identity=(side,0,1,1,1);self.flow.binocular.identities[side]=identity
+                capture.completed[side]=[]
+                for i in range(10):
+                    stamp=100+index+i*.05;eye=pupil(target,BASE)
+                    sample={'time':stamp,'features':BASE.tolist(),'epoch':1}
+                    capture.completed[side].append(dict(time=stamp,eye=eye.tolist(),head=BASE.tolist(),head_sample=sample,identity=identity))
+                    if side=='left':self.flow.calibration_rays.append(dict(source='onboarding',captured_at=stamp,eye=eye.tolist(),raw_eye=eye.tolist(),head=BASE.tolist(),head_sample=sample,target=list(target)))
+            self.flow.binocular.onboarding_captures[index]=capture
+        self.flow.rebase_screen_references()
+        np.testing.assert_allclose(self.flow.head_fit.reference,BASE+shift)
+        for side in ('left','right'):
+            self.assertEqual(self.flow.binocular.identities[side][-1],9)
+            self.assertEqual(len(self.flow.binocular.seeds[side]),5)
+            for eye,head,target in self.flow.binocular.seeds[side]:
+                np.testing.assert_allclose(head,BASE+shift)
+                np.testing.assert_allclose(self.flow.binocular.maps[side].project(eye),target)
+        # Starting the head stage used to invalidate only the companion map
+        # when DualHeadCamera.learn advanced the feature epoch.
+        def begin(): self.flow.head_camera.epoch=10
+        self.flow.head_camera.learn=begin
+        self.flow.start_view_alignment()
+        self.assertEqual(self.flow.phase,'views')
+        for side in ('left','right'):
+            identity=self.flow.binocular.identities[side]
+            self.assertEqual(identity[-1],10)
+            obs=dict(identity=identity,eye=pupil(TARGETS[0],BASE),head=BASE+shift)
+            np.testing.assert_allclose(self.flow.binocular.predict(side,obs),TARGETS[0])
+
+    def test_optional_webcam_failure_keeps_center_then_checks_recorded_primary_movement(self):
+        from unittest.mock import MagicMock
+        head=MagicMock()
+        head.epoch=9
+        head.status.return_value={'second_view':{'collecting':True,'last_sample_time':None}}
+        head.primary.sample_at.side_effect=lambda now:{'time':now}
+        self.flow.head_camera=head
+        self.flow.mapping=FivePointMap(np.array(TARGETS)*[.18,.14]+[.38,.35])
+        self.flow.two_view_guided=True
+        self.flow.start_view_alignment()
+        self.now=102.;self.flow.tick()
+        self.assertEqual(self.flow.views_started,102.)
+        self.assertEqual(self.flow.phase,'views')
+        head.learn.side_effect=ValueError('Views did not agree on later movements')
+        with patch.object(self.flow,'rebase_screen_references') as rebase,patch.object(self.flow,'fit_recorded_movement') as fit:
+            self.now=166.1;self.flow.tick()
+            rebase.assert_called_once();fit.assert_called_once()
+        self.assertIn('Views did not agree',self.flow.views_fallback_reason)
+        self.assertNotEqual(self.flow.phase,'paused')
+        self.assertIsNotNone(self.flow.mapping)
+        self.flow.guided_motion_outcome='previous_fit_kept'
+        self.flow.finish_guided_calibration()
+        self.assertEqual(self.flow.phase,'verify')
 
     def test_guided_five_targets_fit_both_eyes_when_right_settles_later(self):
         from test_binocular_calibration import observation
@@ -546,7 +712,7 @@ class HybridFlowTests(unittest.TestCase):
 
     def test_single_flow_finishes_and_head_turn_keeps_cursor_at_gaze_target(self):
         self.finish()
-        self.assertLess(self.now-100,50)
+        self.assertLess(self.now-100,self.flow.GUIDED_MOTION_SECONDS+ORBIT_SECONDS+15)
         # Screen feedback intentionally settles after a newly confirmed fixation.
         for _ in range(20):
             self.feed((.75,.25))
@@ -587,13 +753,13 @@ class HybridFlowTests(unittest.TestCase):
             self.flow.stop_step()
             for _ in range(100):self.feed()
             self.assertEqual(self.flow.phase,'paused')
-            self.assertEqual(self.flow.stopped_stage,'head')
+            self.assertEqual(self.flow.stopped_stage,'fitting' if phase=='waiting' else 'head')
             self.head.epoch+=1
             self.feed()
             self.assertEqual(self.flow.phase,'paused')
-            self.assertEqual(self.flow.stopped_stage,'head')
+            self.assertEqual(self.flow.stopped_stage,'fitting')
             self.flow.retry_step()
-            self.assertEqual(self.flow.phase,'head')
+            self.assertEqual(self.flow.phase,'fitting')
 
     def test_late_stop_cannot_discard_a_just_completed_map(self):
         self.finish()
@@ -1137,11 +1303,38 @@ class HybridFlowTests(unittest.TestCase):
         self.assertEqual(self.flow.phase,'screen')
         self.assertEqual(self.flow.head_fit.mode,'steady')
 
-    def test_onboarding_starts_with_center_instead_of_circular_sweep(self):
+    def test_target_free_eye_circles_precede_five_dots_without_training_labels(self):
         for _ in range(30):self.feed()
+        self.assertEqual(self.flow.phase,'fitting')
+        self.assertIsNone(self.flow.state()['target'])
+        self.assertTrue(self.flow.state()['eye_scan_enabled'])
+        self.assertEqual(self.c.eye_model.phase,'collecting')
+        started=self.flow.started_at
+        with patch.object(self.flow,'log_observation') as log:
+            for i in range(30):self.feed(target=(.5+.4*math.cos(i/5),.5+.4*math.sin(i/5)))
+        self.assertTrue(all(call.args[1] is None for call in log.call_args_list))
+        self.assertEqual(self.flow.pairs,[])
+        self.assertEqual(self.flow.fixations,[])
+        self.assertEqual(self.flow.calibration_rays,[])
+        # The finite preparation does not turn into another confidence gate.
+        self.now=started+ORBIT_SECONDS-.1
+        self.assertAlmostEqual(self.flow.state()['remaining_seconds'],.1)
+        self.now=started+ORBIT_SECONDS
+        self.flow.tick(self.now)
         self.assertEqual(self.flow.phase,'head')
         self.assertEqual(self.flow.state()['target'],[.5,.5])
-        self.assertIsNone(self.flow.head_cue)
+        self.assertEqual(self.flow.state()['remaining_seconds'],self.flow.TOTAL_SECONDS)
+        self.assertEqual(self.flow.pairs,[])
+
+    def test_eye_circles_stop_and_retry_with_a_fresh_countdown(self):
+        for _ in range(30):self.feed()
+        self.flow.stop_step();self.now+=40;self.flow.tick(self.now)
+        self.assertEqual(self.flow.phase,'paused')
+        self.assertIsNone(self.flow.state()['target'])
+        self.flow.retry_step()
+        self.assertEqual(self.flow.phase,'fitting')
+        self.assertEqual(self.flow.state()['remaining_seconds'],ORBIT_SECONDS)
+        with patch.object(self.c.eye_model,'status',return_value={'can_freeze':True}):self.feed()
         self.assertEqual(self.c.eye_model.phase,'collecting')
 
     def test_camera_space_direction_requires_a_real_fresh_eye_model(self):

@@ -1,7 +1,8 @@
 import cv2
 import time
 from pupil_tracking import PupilTrack
-from eye_geometry import fit_eye_center, trace_iris, ellipse_normal, refine_pupil_with_iris, iris_supported_confidence, detect_pupil_in_iris
+from pupil_stabilization import PupilStabilizer, border_candidate
+from eye_geometry import fit_eye_sphere, sphere_direction, fit_eye_center, trace_iris, ellipse_normal, refine_pupil_with_iris, iris_supported_confidence, detect_pupil_in_iris
 import sys
 import random
 import math
@@ -22,6 +23,8 @@ except ImportError:
     if __name__ == "__main__":
         print("gl_sphere module not found. OpenGL rendering will be disabled.")
 
+sphere_iris_history = []
+last_sphere_fit = None
 ray_lines = []  # Store recent pupil ellipse rays
 model_centers = []  # Store recent estimated eye centers
 min_model_centers = 30  # Minimum model centers required before updating sphere radius
@@ -37,6 +40,7 @@ minimum_intersection_angle_degrees = 8  # Minimum angle between sampled rays
 last_tracking_result = None
 _iris_search_pupil = None  # Store the latest tracker output
 _pupil_track = PupilTrack()
+_pupil_stabilizer = PupilStabilizer()
 from raster_hold import RasterHold
 _raster_hold = RasterHold()
 eye_region = None  # Optional normalized eye-only search area, set by EyeCursor.
@@ -100,10 +104,10 @@ def get_darkest_area(image, search_region=None):
     if search_region is not None:
         x0, y0 = max(x0, search_region[0]), max(y0, search_region[1])
         x1, y1 = min(x1, search_region[2]), min(y1, search_region[3])
-    start_x = max(ignoreBounds, int(x0 * gray.shape[1]))
-    start_y = max(ignoreBounds, int(y0 * gray.shape[0]))
-    stop_x = min(gray.shape[1] - ignoreBounds, int(x1 * gray.shape[1]) - searchArea)
-    stop_y = min(gray.shape[0] - ignoreBounds, int(y1 * gray.shape[0]) - searchArea)
+    start_x = max(ignoreBounds, int(.06*gray.shape[1]), int(x0 * gray.shape[1]))
+    start_y = max(ignoreBounds, int(.06*gray.shape[0]), int(y0 * gray.shape[0]))
+    stop_x = min(int(.94*gray.shape[1])-searchArea, gray.shape[1] - ignoreBounds, int(x1 * gray.shape[1]) - searchArea)
+    stop_y = min(int(.94*gray.shape[0])-searchArea, gray.shape[0] - ignoreBounds, int(y1 * gray.shape[0]) - searchArea)
     ys = np.arange(start_y, stop_y + 1, imageSkipSize)
     xs = np.arange(start_x, stop_x + 1, imageSkipSize)
     if not len(xs) or not len(ys):
@@ -112,7 +116,13 @@ def get_darkest_area(image, search_region=None):
     for dy in range(0, searchArea, internalSkipSize):
         for dx in range(0, searchArea, internalSkipSize):
             sums += gray[np.ix_(ys + dy, xs + dx)]
-    row, column = np.unravel_index(np.argmin(sums), sums.shape)
+    # A soft mounting prior: the eye is normally inside the image, while
+    # darker housing/skin shadows often sit near its border. This only ranks
+    # seeds; it never pulls a fitted pupil towards the image center.
+    xx = (xs + searchArea/2 - gray.shape[1]/2) / (gray.shape[1]/2)
+    yy = (ys + searchArea/2 - gray.shape[0]/2) / (gray.shape[0]/2)
+    scores = sums/16. + 50*(yy[:,None]**2 + xx[None,:]**2)
+    row, column = np.unravel_index(np.argmin(scores), scores.shape)
     return (int(xs[column]) + searchArea // 2, int(ys[row]) + searchArea // 2)
 
 # Mask all pixels outside a square defined by center and size
@@ -212,35 +222,14 @@ def distance_to_pupil_outer_edge(eye_center, pupil_ellipse):
     return center_distance + edge_offset
 
 def update_eye_sphere_radius(eye_center, current_pupil_ellipse, current_pupil_confidence):
-    global max_observed_distance
-    global last_sphere_radius_ellipse
-
-    if last_sphere_radius_ellipse is not None:
-        anchored_distance = distance_to_pupil_outer_edge(
-            eye_center,
-            last_sphere_radius_ellipse,
-        )
-        if anchored_distance is not None:
-            max_observed_distance = anchored_distance
-
-    if (
-        current_pupil_ellipse is not None
-        and current_pupil_confidence >= pupil_confidence_threshold_sphere
-        and len(model_centers) >= min_model_centers
-    ):
-        current_distance = distance_to_pupil_outer_edge(
-            eye_center,
-            current_pupil_ellipse,
-        )
-        if (
-            current_distance is not None
-            and (
-                last_sphere_radius_ellipse is None
-                or current_distance > max_observed_distance
-            )
-        ):
-            max_observed_distance = current_distance
-            last_sphere_radius_ellipse = current_pupil_ellipse
+    """Compatibility entry point; size comes from a multi-view geometry fit."""
+    global max_observed_distance, last_sphere_fit
+    if current_pupil_confidence < pupil_confidence_threshold_sphere:return None
+    fitted=fit_eye_sphere(ray_lines,(480,640),sphere_iris_history)
+    if fitted is not None:
+        max_observed_distance=fitted['radius_px']
+        last_sphere_fit=fitted
+    return fitted
 
 def get_eye_sphere_adjustment_prompt():
     if eye_sphere_adjustment_enabled:
@@ -332,6 +321,7 @@ def check_ellipse_goodness(binary_image, contour, debug_mode_on):
 def process_frames(thresholded_image_strict, thresholded_image_medium, thresholded_image_relaxed, frame, gray_frame, darkest_point, debug_mode_on, render_cv_window, iris_hint=None, timestamp=None):
     global ray_lines
     global max_rays
+    global sphere_iris_history, last_sphere_fit
     global prev_model_center_avg
     global max_observed_distance
     global last_sphere_radius_ellipse
@@ -450,8 +440,13 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
             gray_frame, final_rotated_rect, iris, raw_pupil_confidence)
         best_ratio_under_ellipse = max(raw_pupil_confidence, iris_pupil_confidence)
 
-    temporal = _pupil_track.update(final_rotated_rect, best_ratio_under_ellipse, iris,
-                                   time.monotonic() if timestamp is None else timestamp)
+    stamp = time.monotonic() if timestamp is None else timestamp
+    measured_pupil = final_rotated_rect
+    if border_candidate(final_rotated_rect, gray_frame.shape):
+        _pupil_track.update(None, 0., None, stamp)
+        temporal = {'accepted': False, 'reason': 'frame-border'}
+    else:
+        temporal = _pupil_track.update(final_rotated_rect, best_ratio_under_ellipse, iris, stamp)
     if final_rotated_rect is not None and not temporal['accepted']:
         # Keep the current candidate visible as rejected evidence, but never feed
         # it into gaze, calibration, or eye-model updates. A rejection is not a blink.
@@ -472,6 +467,8 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
         }
         return None
 
+    final_rotated_rect, stabilization = _pupil_stabilizer.update(
+        gray_frame, final_rotated_rect, best_ratio_under_ellipse, stamp)
     center_x, center_y = None, None
     if final_rotated_rect is not None:
         center_x, center_y = map(int, final_rotated_rect[0])
@@ -479,50 +476,32 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
             eye_sphere_adjustment_enabled
             and best_ratio_under_ellipse >= pupil_confidence_threshold
         ):
-            # The enclosing iris provides a second ray only when its shape and
-            # orientation agree with a noncircular pupil. Eyelid-clipped iris
-            # contours must not give circular pupils a fabricated direction.
-            ray = final_rotated_rect
-            pupil_normal = ellipse_normal(ray)
-            iris_normal = ellipse_normal(iris['ellipse']) if iris else None
-            if (iris_normal is not None and pupil_normal is not None
-                    and abs(iris_normal[1] - pupil_normal[1]) < .12
-                    and abs(float(pupil_normal[0] @ iris_normal[0])) > .94):
-                ray = iris['ellipse']
-            if ellipse_normal(ray) is not None:
-                ray_lines.append(ray)
+            # Use the same pupil plane throughout the joint scale fit. Iris
+            # evidence validates enclosure; it is not mixed into pupil rays.
+            if ellipse_normal(final_rotated_rect) is not None:
+                ray_lines.append(final_rotated_rect)
+                sphere_iris_history.append(iris['ellipse'] if iris and iris['support']>=.65 else None)
                 new_ray = True
             if len(ray_lines) > max_rays:
                 num_to_remove = len(ray_lines) - max_rays
                 ray_lines = ray_lines[num_to_remove:]  # Keep only the last `max_rays` elements
+                sphere_iris_history = sphere_iris_history[num_to_remove:]
 
     model_center_average = prev_model_center_avg
 
     if eye_sphere_adjustment_enabled and new_ray:
-        model_center = compute_average_intersection(
-            frame,
-            ray_lines,
-            intersection_ray_count,
-            1500,
-            minimum_intersection_angle_degrees,
-        )
-        if model_center is not None and model_center != (0, 0):
-            model_center_average = update_and_average_point(model_centers, model_center, 45)
-            model_updated = True
-
-    prev_model_center_avg = model_center_average
-    
-    # Example safety check
-    if center_x is None or center_y is None or model_center_average[0] is None or model_center_average[1] is None:
-        last_tracking_result = None
-        return  # or skip this frame
-
-    if eye_sphere_adjustment_enabled:
-        update_eye_sphere_radius(
-            model_center_average,
-            final_rotated_rect,
-            best_ratio_under_ellipse,
-        )
+        fitted=update_eye_sphere_radius(model_center_average,final_rotated_rect,best_ratio_under_ellipse)
+        if fitted is not None:
+            # Center and radius belong to one fit; never average the center
+            # separately and combine it with an unrelated historical radius.
+            model_center_average=tuple(round(v) for v in fitted['center'])
+            model_centers.append(model_center_average)
+            del model_centers[:-45]
+            model_updated=True
+    prev_model_center_avg=model_center_average
+    if center_x is None or center_y is None:
+        last_tracking_result=None
+        return
 
     last_tracking_result = {
         "pupil_ellipse": {
@@ -532,7 +511,8 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
         } if final_rotated_rect is not None else None,
         "eye_center": [int(model_center_average[0]), int(model_center_average[1])],
         "sphere_radius": float(max_observed_distance),
-        "eye_model_estimated": len(model_centers) >= min_model_centers,
+        "eye_model_estimated": last_sphere_fit is not None and len(model_centers) >= min_model_centers,
+        "eye_sphere_fit": last_sphere_fit,
         "eye_model_updated": model_updated,
         "iris_ellipse": ({"center": list(iris["ellipse"][0]), "axes": list(iris["ellipse"][1]),
                           "angle_degrees": iris["ellipse"][2]} if iris else None),
@@ -544,14 +524,18 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
         "pupil_edge_points": edge_pupil["edge_points"] if edge_pupil else [],
         "raw_pupil_ellipse": ({"center": list(raw_pupil[0]), "axes": list(raw_pupil[1]),
                                "angle_degrees": raw_pupil[2]} if raw_pupil else None),
+        "measured_pupil_ellipse": ({"center": list(measured_pupil[0]), "axes": list(measured_pupil[1]),
+                                    "angle_degrees": float(measured_pupil[2])} if measured_pupil else None),
+        "pupil_stabilization": stabilization,
         "eye_model_samples": len(model_centers),
         "confidence": float(best_ratio_under_ellipse),
         "temporal_tracking": temporal,
     }
 
     # Draw reference lines/ellipses
-    cv2.circle(frame, model_center_average, int(max_observed_distance), (255, 50, 50), 2)  # Draw eye sphere (circle)
-    cv2.circle(frame, model_center_average, 8, (255, 255, 0), -1)  # Draw eye center
+    if last_tracking_result["eye_model_estimated"]:
+        cv2.circle(frame, model_center_average, int(max_observed_distance), (255, 50, 50), 2)
+        cv2.circle(frame, model_center_average, 8, (255, 255, 0), -1)
     if final_rotated_rect is not None and center_x is not None and center_y is not None:
         cv2.line(frame, model_center_average, (center_x, center_y), (255, 150, 50), 2)  # # Draw line from eye center to ellipse center
         
@@ -602,7 +586,7 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
     cv2.putText(frame, prompt_text, prompt_origin, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
 
     # Call the function
-    center, direction = compute_gaze_vector(center_x, center_y, model_center_average[0], model_center_average[1])
+    center, direction = compute_gaze_vector(*final_rotated_rect[0], *model_center_average)
     if last_tracking_result is not None and direction is not None:
         last_tracking_result["gaze_direction"] = [float(value) for value in direction]
 
@@ -650,6 +634,9 @@ def reset_tracking_state():
     global _iris_search_pupil
     global last_tracking_result
 
+    global sphere_iris_history, last_sphere_fit
+    sphere_iris_history = []
+    last_sphere_fit = None
     ray_lines = []
     model_centers = []
     prev_model_center_avg = (320, 240)
@@ -661,6 +648,7 @@ def reset_tracking_state():
     stuck_ellipses = []
     _iris_search_pupil = None
     _pupil_track.reset()
+    _pupil_stabilizer.reset()
     _raster_hold.reset()
     last_tracking_result = None
 
@@ -755,141 +743,18 @@ def find_line_intersection(ellipse1, ellipse2):
     return (int(intersection_x), int(intersection_y))
 
 def compute_gaze_vector(x, y, center_x, center_y, screen_width=640, screen_height=480):
-    """Compute 3D gaze direction from pupil and sphere center screen coordinates.
-    Returns:
-        sphere_center (np.ndarray): 3D position of the sphere center in world space
-        gaze_direction (np.ndarray): Normalized 3D direction vector from sphere center
+    """Camera-view direction from the supported fit; origin is image pixels.
+
+    Kept as the original library entry point. No arbitrary virtual camera/FOV or
+    tangent-point fallback is used when the measured geometry is unavailable.
     """
-
-    # Get viewport dimensions
-    viewport_width = screen_width
-    viewport_height = screen_height
-
-    # Define camera and projection settings
-    fov_y_deg = 45.0
-    aspect_ratio = viewport_width / viewport_height
-    far_clip = 100.0
-
-    # Camera position is fixed at z = 3
-    camera_position = np.array([0.0, 0.0, 3.0])
-
-    # Compute size of far plane in world units
-    fov_y_rad = np.radians(fov_y_deg)
-    half_height_far = np.tan(fov_y_rad / 2) * far_clip
-    half_width_far = half_height_far * aspect_ratio
-
-    # Convert screen (x, y) to normalized device coordinates [-1, 1]
-    ndc_x = (2.0 * x) / viewport_width - 1.0
-    ndc_y = 1.0 - (2.0 * y) / viewport_height
-
-    # Project pupil center to far plane coordinates in world space
-    far_x = ndc_x * half_width_far
-    far_y = ndc_y * half_height_far
-    far_z = camera_position[2] - far_clip
-    far_point = np.array([far_x, far_y, far_z])
-
-    # Compute ray direction from camera to far plane point
-    ray_origin = camera_position
-    ray_direction = far_point - camera_position
-    ray_direction /= np.linalg.norm(ray_direction)
-    ray_direction = -ray_direction
-
-    # Sphere radius and center offset
-    inner_radius = 1.0 / 1.05
-    sphere_offset_x = (center_x / screen_width) * 2.0 - 1.0
-    sphere_offset_y = 1.0 - (center_y / screen_height) * 2.0
-    sphere_center = np.array([sphere_offset_x * 1.5, sphere_offset_y * 1.5, 0.0])
-
-    # Compute intersection with sphere
-    origin = ray_origin
-    direction = -ray_direction
-    L = origin - sphere_center
-
-    a = np.dot(direction, direction)
-    b = 2 * np.dot(direction, L)
-    c = np.dot(L, L) - inner_radius**2
-
-    discriminant = b**2 - 4 * a * c
-    if discriminant < 0:
-        # Compute the closest point to the sphere (tangent point approximation)
-        t = -np.dot(direction, L) / np.dot(direction, direction)
-        intersection_point = origin + t * direction
-        intersection_local = intersection_point - sphere_center
-        target_direction = intersection_local / np.linalg.norm(intersection_local)
-    else:
-        sqrt_disc = np.sqrt(discriminant)
-        t1 = (-b - sqrt_disc) / (2 * a)
-        t2 = (-b + sqrt_disc) / (2 * a)
-
-        t = None
-        if t1 > 0 and t2 > 0:
-            t = min(t1, t2)
-        elif t1 > 0:
-            t = t1
-        elif t2 > 0:
-            t = t2
-        if t is None:
-            return None, None
-
-    # Final intersection point
-    intersection_point = origin + t * direction
-    intersection_local = intersection_point - sphere_center
-    target_direction = intersection_local / np.linalg.norm(intersection_local)
-
-    # Local green ring direction
-    circle_local_center = np.array([0.0, 0.0, inner_radius])
-    circle_local_center /= np.linalg.norm(circle_local_center)
-
-    # Compute rotation to align local +Z to target
-    rotation_axis = np.cross(circle_local_center, target_direction)
-    rotation_axis_norm = np.linalg.norm(rotation_axis)
-    if rotation_axis_norm < 1e-6:
-        return sphere_center, circle_local_center
-
-    rotation_axis /= rotation_axis_norm
-    dot = np.dot(circle_local_center, target_direction)
-    dot = np.clip(dot, -1.0, 1.0)
-    angle_rad = np.arccos(dot)
-
-    # Rotation matrix from axis-angle
-    c = np.cos(angle_rad)
-    s = np.sin(angle_rad)
-    t_ = 1 - c
-    x_, y_, z_ = rotation_axis
-
-    rotation_matrix = np.array([
-        [t_*x_*x_ + c, t_*x_*y_ - s*z_, t_*x_*z_ + s*y_],
-        [t_*x_*y_ + s*z_, t_*y_*y_ + c, t_*y_*z_ - s*x_],
-        [t_*x_*z_ - s*y_, t_*y_*z_ + s*x_, t_*z_*z_ + c]
-    ])
-
-    # Rotate +Z vector to get gaze direction
-    gaze_local = np.array([0.0, 0.0, inner_radius])
-    gaze_rotated = rotation_matrix @ gaze_local
-    gaze_rotated /= np.linalg.norm(gaze_rotated)
-
-    # Write to file (overwrite every frame)
-    file_path = "gaze_vector.txt"
-
-    def is_file_available(path):
-        try:
-            with open(path, "a"):
-                return True
-        except IOError:
-            return False
-
-    if is_file_available(file_path):
-        try:
-            with open(file_path, "w") as f:
-                all_values = np.concatenate((sphere_center, gaze_rotated))
-                csv_line = ",".join(f"{v:.6f}" for v in all_values)
-                f.write(csv_line + "\n")
-        except Exception as e:
-            print("Write error:", e)
-    else:
-        print("File is currently in use. Skipping write.")
-
-    return sphere_center, gaze_rotated
+    if not last_sphere_fit or not (last_tracking_result or {}).get('eye_model_estimated'):
+        return None, None
+    ellipse=last_tracking_result.get('pupil_ellipse')
+    if not ellipse:return None, None
+    pupil=((x,y),ellipse['axes'],ellipse['angle_degrees'])
+    direction=sphere_direction(pupil,(center_x,center_y),last_sphere_fit['rotation_radius_px'])
+    return np.array([center_x,center_y,0.]), direction
 
 def draw_stuck_ellipses(frame):
     global stuck_ellipses
@@ -905,6 +770,12 @@ def process_frame(frame, timestamp=None):
     # Keep pixels before legacy rendering annotates its working frame.
     raster=crop_to_aspect_ratio(frame).copy()
     ellipse=_process_frame(frame,timestamp=stamp)
+    # A brief failed pupil does not invalidate an already fitted eyeball.
+    # Keep the supported model visible, without inventing a pupil or gaze ray.
+    if last_sphere_fit is not None and len(model_centers)>=min_model_centers:
+        last_tracking_result=dict(last_tracking_result or {}, eye_center=list(prev_model_center_avg),
+                                  sphere_radius=float(max_observed_distance), eye_model_estimated=True,
+                                  eye_sphere_fit=last_sphere_fit)
     last_tracking_result=_raster_hold.update(raster,last_tracking_result,stamp,pupil_confidence_threshold)
     return ellipse
 

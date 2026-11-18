@@ -29,6 +29,7 @@ class EyeCameraRig:
         self.samples = {}
         self.tracking = {}
         self.sphere_fixed = {}
+        self.sphere_pending = set()
         self.observation_history = {eye: deque(maxlen=600) for eye in ("left","right")}
         self.tracking_errors = {}
         self.revisions = {'left': 0, 'right': 0}
@@ -105,6 +106,7 @@ class EyeCameraRig:
             for eye in ('left', 'right'):
                 if any(new[eye][key] != self.config[eye][key] for key in ('device_id', 'rotation')):
                     self.sphere_fixed.pop(eye, None)
+                    self.sphere_pending.discard(eye)
                     self.samples.pop(eye, None)
                     self.tracking.pop(eye, None)
                     self.tracking_errors.pop(eye, None)
@@ -121,11 +123,21 @@ class EyeCameraRig:
             config[eye]['fixed_eye_sphere'] = fixed
             self.configure(config)
 
-    def apply_eye_sphere_setting(self, eye, detector, model):
+    def apply_eye_sphere_setting(self, eye, detector, model, force_collecting=False):
         with self.lock:
             # Existing setups retain automatic readiness-based freezing until
             # the user explicitly chooses fixed or automatic adjustment.
             fixed = self.config[eye].get('fixed_eye_sphere', model.phase != 'collecting')
+            # A saved 'fixed' preference cannot freeze an empty/reset model.
+            supported = (getattr(detector,'last_sphere_fit',None) is not None
+                         and len(detector.model_centers)>=detector.min_model_centers)
+            if fixed and not supported:self.sphere_pending.add(eye)
+            if not fixed:self.sphere_pending.discard(eye)
+            if eye in self.sphere_pending:
+                if model.phase=='ready' or model.status(self.clock())['can_freeze']:
+                    self.sphere_pending.discard(eye)
+                else:fixed=False
+            fixed = fixed and supported and not force_collecting
             detector.eye_sphere_adjustment_enabled = not fixed
             self.sphere_fixed[eye] = fixed
 
@@ -267,6 +279,11 @@ class EyeCameraRig:
                                   'valid': valid, 'result': result}
             self.tracking_errors.pop(eye, None)
             self.tracking_times[eye].append(sample['time'])
+        from diagnostic_recording import publish
+        publish(eye,sample['time'],sample['frame'],jpeg,
+                dict(detector=result,accepted=valid,threshold=threshold,
+                     camera_context=sample['context'],serial=sample['serial'],
+                     revision=sample['revision'],camera_session=sample['session']))
 
     def remember_observation(self, eye, sample, result, threshold):
         """Numeric history for target captures committed after a one-second hold."""
@@ -287,7 +304,7 @@ class EyeCameraRig:
             if history and history[-1]['identity']!=identity:history.clear()
             if history and sample['time']<=history[-1]['time']:return
             history.append({'identity':identity,'time':sample['time'],'eye':raw.tolist(),
-                            'head':features.tolist(),'confidence':result['confidence']})
+                            'head':features.tolist(),'head_sample':head,'confidence':result['confidence']})
 
     def observations_at(self, stamp, tolerance=.12):
         with self.lock:
@@ -362,6 +379,7 @@ class EyeCameraRig:
                              'tracking': ('Pupil tracked' if tracked['valid'] else 'Searching for pupil') if tracking_fresh else 'Waiting for detection',
                              'confidence': result.get('confidence'),
                              'pupil_center': (result.get('pupil_ellipse') or {}).get('center'),
+                             'eyeball_model_status': 'estimated' if result.get('eye_model_estimated') else 'collecting' if tracking_fresh else 'waiting',
                              'gaze_direction': result.get('gaze_direction'),
                              'scene_direction': direction,
                              'tracking_epoch': f'{self.revisions[eye]}:{self.sessions[eye]}',

@@ -33,7 +33,9 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, SCRecordingOut
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         if firstPTS == nil {
             firstPTS = pts
-            let epoch = Int64(Date().timeIntervalSince1970 * 1_000_000_000)
+            // PTS is the host capture clock, earlier than callback delivery.
+            let latency = CMTimeGetSeconds(CMTimeSubtract(CMClockGetTime(CMClockGetHostTimeClock()), pts))
+            let epoch = Int64((Date().timeIntervalSince1970 - latency) * 1_000_000_000)
             print(jsonLine(["type": "start", "epoch_ns": epoch,
                             "display_id": display.displayID, "width": display.width,
                             "height": display.height]), terminator: "")

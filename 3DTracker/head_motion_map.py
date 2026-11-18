@@ -16,6 +16,7 @@ class HeadMotionMap:
         self.head_coefficients=np.array(head_fit.coefficients,copy=True)
         self.eye_center=np.asarray(seeds[0][0]);self.validation_error=None
         self.quadratic_interactions=True
+        self.kernel_centers=None
         self.eyes=np.array([s[0] for s in seeds]);self.error=None
 
     def design(self,poses):
@@ -33,6 +34,18 @@ class HeadMotionMap:
         if hasattr(self.base,'project_pose_unbounded'):
             return self.base.project_pose_unbounded(point,self.reference,True)
         return project_unbounded(self.base,point)
+
+    @staticmethod
+    def kernel(x,centers,width):
+        return np.exp(-np.sum((np.asarray(x)[...,None,:]-centers)**2,axis=-1)/(2*width**2))
+
+    def displacement(self,pose):
+        value=self.design(pose)@self.coefficients
+        centers=getattr(self,'kernel_centers',None)
+        if centers is not None:
+            x=(np.asarray(pose)-self.reference)/POSE_SCALE
+            value=value+self.kernel(x,centers,self.kernel_width)@self.kernel_coefficients
+        return value
 
     @classmethod
     def fit(cls,base,head_fit,seeds,samples,*args,**kwargs):
@@ -64,7 +77,13 @@ class HeadMotionMap:
         eyes,poses=map(np.asarray,zip(*blocks))
         # Displacement includes any already established head compensation.
         y=eyes-model.eye_center-(poses-model.reference)/HEAD_SCALE@model.head_coefficients
-        split=max(10,int(len(blocks)*.7));best=None
+        # A single final 30% split held out mostly the last instructed motion
+        # (turning), selecting a polynomial that could overfit depth/nodding.
+        # Hold out 2s blocks throughout each 8s interval instead. These are all
+        # TRAINING-cycle rows; the later full movement cycle stays untouched.
+        times=np.array(list(groups))*.4
+        folds=(times%8//2).astype(int)
+        best=None;selection=[]
         def solve(x,y,ridge):
             weights=np.ones(len(y))
             for _ in range(6):
@@ -72,19 +91,51 @@ class HeadMotionMap:
                 residual=np.linalg.norm(x@c-y,axis=1)
                 weights=np.minimum(1.,.008/np.maximum(residual,1e-6))
             return c,residual
-        for degree in (1,2):
-            model.degree=degree;x=model.design(poses)
-            for ridge in (.1,1.,10.,100.):
-                c,_=solve(x[:split],y[:split],ridge)
-                score=float(np.percentile(np.linalg.norm(x[split:]@c-y[split:],axis=1),80))
-                if best is None or score<best[0]:best=(score,degree,ridge)
-        model.degree=best[1];model.ridge=best[2]
-        model.coefficients,residual=solve(model.design(poses),y,model.ridge)
+        normalized=(poses-model.reference)/POSE_SCALE
+        def fit_candidate(indices,degree,ridge,width):
+            model.degree=degree;x=model.design(poses[indices])
+            if width is None:
+                c,_=solve(x,y[indices],ridge)
+                return c,None
+            # A linear counter-rotation term plus a smooth local residual avoids
+            # forcing every mounting/landmark error into global cross-products.
+            c=np.linalg.solve(x.T@x+np.eye(x.shape[1])*.1,x.T@y[indices])
+            k=model.kernel(normalized[indices],normalized[indices],width)
+            beta=np.linalg.solve(k+np.eye(len(k))*ridge,y[indices]-x@c)
+            return c,beta
+        candidates=[(d,r,None) for d in (1,2) for r in (.1,1.,10.,100.)]
+        candidates += [(1,r,w) for w in (.5,1.,2.,4.) for r in (.01,.1,1.)]
+        for degree,ridge,width in candidates:
+            errors=[]
+            for fold in range(4):
+                held=folds==fold;keep=~held
+                if not held.any() or np.sum(keep)<8:continue
+                c,beta=fit_candidate(keep,degree,ridge,width)
+                prediction=model.design(poses[held])@c
+                if beta is not None:
+                    prediction+=model.kernel(normalized[held],normalized[keep],width)@beta
+                # Select for screen error, not IR pixel error: the five-dot map
+                # establishes a different gain for the two pupil coordinates.
+                for measured,delta in zip(y[held],prediction):
+                    uv=model.reference_project(model.eye_center+measured-delta)
+                    errors.append(np.linalg.norm(uv-[.5,.5]) if uv is not None else 10.)
+            if not errors:continue
+            score=float(np.percentile(errors,80))
+            selection.append(dict(degree=degree,ridge=ridge,kernel_width=width,error_p80_uv=score))
+            if best is None or score<best[0]:best=(score,degree,ridge,width)
+        if best is None:raise ValueError('More independent head movement blocks are needed for model selection')
+        model.degree=best[1];model.ridge=best[2];model.kernel_width=best[3]
+        model.coefficients,beta=fit_candidate(np.ones(len(poses),dtype=bool),model.degree,model.ridge,model.kernel_width)
+        if beta is not None:
+            model.kernel_centers=normalized.copy();model.kernel_coefficients=beta
+        residual=np.linalg.norm(model.displacement(poses)-y,axis=1)
         model.bounds=np.percentile(poses,[0,100],axis=0)
         model.fit_metrics={'model':'empirical_head_displacement','motion_blocks':len(blocks),
-            'inner_check_pupil_error':best[0],'degree':model.degree,'ridge':model.ridge,
+            'inner_check_screen_error_p80_uv':best[0],'degree':model.degree,'ridge':model.ridge,
+            'kernel_width':model.kernel_width,'selection_method':'four_blocked_folds_training_only',
+            'selection_candidates':selection,
             'downweighted_blocks':int(np.sum(residual>.008)),
-            'feature_schema':'head_quadratic_cross_v2'}
+            'feature_schema':'head_displacement_blocked_v3'}
         return model
 
     def project_raw(self,raw,pose):
@@ -101,7 +152,7 @@ class HeadMotionMap:
         """Evaluate a held-out pose before deciding whether to extend support."""
         raw,pose=np.asarray(raw),np.asarray(pose)
         if raw.shape!=(2,) or pose.shape!=(6,) or not np.isfinite(np.r_[raw,pose]).all():return None
-        corrected=raw-(pose-self.reference)/HEAD_SCALE@self.head_coefficients-self.design(pose)@self.coefficients
+        corrected=raw-(pose-self.reference)/HEAD_SCALE@self.head_coefficients-self.displacement(pose)
         return self.reference_project(corrected)
 
     def project_pose_unbounded(self,point,pose,baseline_allowed=True):

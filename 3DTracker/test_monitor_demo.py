@@ -14,6 +14,14 @@ def frame(x, y, confidence=0.9):
 
 
 class EyeDiagnosticsTests(unittest.TestCase):
+    def test_supported_sphere_survives_a_rejected_pupil_without_a_gaze_arrow(self):
+        image=np.full((480,640,3),100,dtype=np.uint8)
+        result={'eye_model_estimated':True,'eye_center':[320,240],'sphere_radius':100,
+                'confidence':0,'pupil_ellipse':{'center':[330,240],'axes':[30,25],'angle_degrees':0}}
+        rendered=render_diagnostic_frame(image,result,eye_model_ready=False)
+        np.testing.assert_array_equal(rendered[240,420],[255,230,60])
+        self.assertFalse(np.any(np.all(rendered==[0,255,0],axis=2)))
+
     def test_raw_diagnostic_frame_keeps_unannotated_pixels_and_owns_copy(self):
         image = np.full((480, 640, 3), 100, dtype=np.uint8)
         calibration = Calibration("test eye camera")
@@ -33,19 +41,17 @@ class EyeDiagnosticsTests(unittest.TestCase):
         cv2.rectangle(image, (20, 20), (180, 150), (0, 0, 0), -1)
         cv2.circle(image, (320, 230), 32, (18, 18, 18), -1)
         calibration = Calibration("test eye camera")
-        self.assertLess(tracker.get_darkest_area(image)[0], 200)
+        self.assertGreater(tracker.get_darkest_area(image)[0], 280, "Default mounting prior should prefer the pupil over a corner shadow")
         calibration.set_eye_region([0.38, 0.3, 0.64, 0.7])
         pupil_seed = tracker.get_darkest_area(image)
         self.assertTrue(280 <= pupil_seed[0] <= 360)
         self.assertTrue(190 <= pupil_seed[1] <= 270)
 
-    def test_vectorized_dark_search_matches_original_sampling(self):
-        image = np.random.default_rng(7).integers(0, 256, (480,640,3), dtype=np.uint8)
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        expected = min(((sum(int(gray[y+dy,x+dx]) for dy in range(0,20,5)
-                             for dx in range(0,20,5)), (x+10,y+10))
-                        for y in range(20,461,10) for x in range(20,621,10)), key=lambda item:item[0])[1]
-        self.assertEqual(tracker.get_darkest_area(image), expected)
+    def test_soft_mounting_prior_does_not_force_off_center_pupil_to_center(self):
+        image = np.full((480,640,3),180,dtype=np.uint8)
+        cv2.circle(image,(440,310),35,(18,18,18),-1)
+        seed=tracker.get_darkest_area(image)
+        self.assertLess(np.linalg.norm(np.asarray(seed)-[440,310]),30)
 
     def test_iris_search_hint_excludes_remote_dark_patch(self):
         image = np.full((480, 640, 3), 190, dtype=np.uint8)

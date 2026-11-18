@@ -121,12 +121,13 @@ class FacePreviewCrop:
 
 
 class HeadCamera:
-    def __init__(self, enumerate_cameras, requested_id=None, model_path=MODEL_PATH, isolated=False):
+    def __init__(self, enumerate_cameras, requested_id=None, model_path=MODEL_PATH, isolated=False, recording_stream='face'):
         self.enumerate_cameras = enumerate_cameras
         self.device_id = requested_id
         self.name = 'Laptop webcam'
         self.model_path = Path(model_path)
         self.isolated = isolated
+        self.recording_stream = recording_stream
         self.lock = threading.Lock()
         self.history = deque(maxlen=60)
         self.stamps = deque(maxlen=60)
@@ -193,6 +194,7 @@ class HeadCamera:
                     h, w = image.shape[:2]
                     if w > 640:
                         image = cv2.resize(image, (640, round(h * 640 / w)))
+                    recording_input=image
                     rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                     ms = max(last_ms + 1, round(stamp * 1000)); last_ms = ms
                     result = detector.detect_for_video(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb), ms)
@@ -225,6 +227,9 @@ class HeadCamera:
                         self.stamps.append(stamp)
                         if ok: self.preview = jpeg.tobytes()
                         self.error = None
+                    from diagnostic_recording import publish
+                    publish(self.recording_stream,stamp,recording_input,jpeg.tobytes() if ok else None,
+                            dict(camera_id=self.device_id,packet=packet,preview_crop=crop))
         except Exception as error:
             with self.lock:
                 self.error = f'Webcam tracking unavailable: {error}'

@@ -3,6 +3,7 @@ import SceneKit
 let app = NSApplication.shared
 app.setActivationPolicy(.prohibited)
 let controller = CalibrationApp(port: 1, hybrid: true)
+controller.calibrationVoice.output = { _ in }
 let runtimeRoot = "/Users/test/Projects/EyeTracker"
 precondition(CalibrationApp.trackerRoot(bundleURL: URL(fileURLWithPath: "/Applications/EyeCursor.app"),
                                        configuredPath: runtimeRoot).path == runtimeRoot,
@@ -321,7 +322,7 @@ let laptopScreen = NSScreen.screens.first { candidate in
     return CGDisplayIsBuiltin(number.uint32Value) != 0
 } ?? screen
 let id = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as! NSNumber).stringValue
-func state(_ phase: String, valid: Bool = true, headPitch: Double = 0, headX: Double = 0.5, cursor: Bool = false, tracked: Bool = true, irEye: Bool = false, circleStart: Double? = nil, fixedTarget: [Double]? = nil, savedTarget: [Double]? = nil, rawGaze: [Double]? = nil, references: Bool = false, webcamRays: [[Double]] = [[0,0,-1],[0,0,-1]], referenceCount: Int = 1, referenceSession: String = "test", referenceShift: Double = 0, geometric: Bool = false, continuous: Bool = false, headApplied: Bool = false, accuracy: [String:Any]? = nil, eyeSide: String? = nil, calibrationProgress: Double = 0.9, accepted: Bool = true, targetIndex: Int = 2, calibrationTarget: [Double]? = nil, cursorProgress: Double = 0.4, irSlots: [String: Any] = [:], eyePredictions: [String: Any] = [:], binocularStatus: String? = nil, headWidth: Double = log(0.3), headReference: [Double]? = nil, guidedOutcome: String? = nil, motionCue: String = "shift") -> TrackerState {
+func state(_ phase: String, valid: Bool = true, headPitch: Double = 0, headX: Double = 0.5, cursor: Bool = false, tracked: Bool = true, irEye: Bool = false, circleStart: Double? = nil, fixedTarget: [Double]? = nil, savedTarget: [Double]? = nil, rawGaze: [Double]? = nil, references: Bool = false, webcamRays: [[Double]] = [[0,0,-1],[0,0,-1]], referenceCount: Int = 1, referenceSession: String = "test", referenceShift: Double = 0, geometric: Bool = false, continuous: Bool = false, headApplied: Bool = false, accuracy: [String:Any]? = nil, eyeSide: String? = nil, calibrationProgress: Double = 0.9, accepted: Bool = true, targetIndex: Int = 2, calibrationTarget: [Double]? = nil, cursorProgress: Double = 0.4, irSlots: [String: Any] = [:], eyePredictions: [String: Any] = [:], binocularStatus: String? = nil, headWidth: Double = log(0.3), headReference: [Double]? = nil, guidedOutcome: String? = nil, motionCue: String = "shift", eyeScan: Bool = false, twoViews: Bool = false, previewEye: String? = nil) -> TrackerState {
     let complete = phase == "complete"
     let captured: [[String:Any]] = references ? (0..<referenceCount).map { i in
         var head = neutralHead; head[3] += referenceShift + Double(i)*0.0001
@@ -342,8 +343,8 @@ func state(_ phase: String, valid: Bool = true, headPitch: Double = 0, headX: Do
                                                "head_features":[0.0,headPitch,0.0,headX,0.4,headWidth],"model_ready":true] as Any : NSNull(),
         "blink_click_enabled": false,
         "eye_model": ["phase": "collecting", "can_freeze": false, "message": "Test"],
-        "onboarding": ["guided_head_outcome":guidedOutcome as Any? ?? NSNull(),"remaining_seconds":phase == "motion" ? 24.0 as Any : NSNull(),"head_reference":headReference as Any? ?? NSNull(),"accuracy_check":accuracy as Any? ?? NSNull(),"phase": phase, "display_id": id, "display_index": 1, "display_count": 1,
-                       "target": complete ? NSNull() as Any : (calibrationTarget ?? [0.08,0.92]), "progress": complete ? 1.0 : calibrationProgress,
+        "onboarding": ["preview_alignment":previewEye.map { ["eye":$0,"target":calibrationTarget ?? [0.2,0.3],"completed":$0 == "right" ? ["left"] : []] as [String:Any] } as Any? ?? NSNull(),"two_view_guided":twoViews,"head_cue":twoViews && phase == "views" ? motionCue as Any : NSNull(),"eye_scan_enabled":eyeScan,"guided_head_outcome":guidedOutcome as Any? ?? NSNull(),"remaining_seconds":eyeScan && phase == "fitting" ? 12.0 as Any : phase == "motion" ? 24.0 as Any : NSNull(),"head_reference":headReference as Any? ?? NSNull(),"accuracy_check":accuracy as Any? ?? NSNull(),"phase": phase, "display_id": id, "display_index": 1, "display_count": 1,
+                       "target": complete || (eyeScan && phase == "fitting") ? NSNull() as Any : (calibrationTarget ?? [0.08,0.92]), "progress": complete ? 1.0 : calibrationProgress,
                        "message": "Test", "elapsed": 10.0, "fast_path": false, "sample_accepted": accepted,
                        "stopped_stage": "head",
                        "screen_path": circleStart == nil ? NSNull() as Any : "quick",
@@ -462,7 +463,7 @@ precondition(companionScene.geometry.childNode(withName:"calibrated-eye-ray-righ
 precondition(controller.gazeEyes.itemTitles == ["Both eyes","Left eye only","Right eye only"])
 precondition(controller.eyeDots["left"]!.frame.size == controller.eyeDots["right"]!.frame.size,
              "Eye cursor rings must share the same component and size")
-precondition(controller.eyeDots.count == 2 && controller.angleDebugger.separateEyes.state == .off)
+precondition(controller.eyeDots.count == 2 && controller.angleDebugger.separateEyes.state == .on)
 for panel in controller.eyeDots.values { precondition(panel.ignoresMouseEvents && !panel.canBecomeKey) }
 let irScene = AngleDebugger()
 irScene.rawDirections.state = .on
@@ -611,6 +612,40 @@ precondition(stableHeadScene.headGeometry(closer).0.z < faceBeforeCalibration.z,
              "Real changes in apparent face size must still move the estimated head")
 // Hold the rendered pose, including a partially smoothed movement, through
 // lost detections, expired measurements, and a failed tracker poll.
+// Reproject rotating eyes around a fixed ear-level head center. Their
+// changing depth must not make the illustrated skull orbit its forehead.
+let pivotScene=AngleDebugger()
+pivotScene.sliders["distance"]!.doubleValue=40
+pivotScene.sliders["camera_pitch"]!.doubleValue=0
+pivotScene.sliders["hx"]!.doubleValue=0;pivotScene.sliders["hy"]!.doubleValue=0
+let cameraY=pivotScene.value("width")/pivotScene.aspect/2+pivotScene.value("webcam")
+let fy:Float=0.5/tan(pivotScene.value("camera_fov") * .pi/360)
+let fx=fy/(16.0/9.0)
+let fixedPivot=SIMD3<Float>(2,3,40)
+for pitch in [-0.35,0,0.35] {
+    var features=[0.0,pitch,0,0.5,0.4,log(0.3)]
+    let orientation=AngleGeometry.headRotation(features,relativeTo:[0,0,0,0,0,0])
+    let eye=fixedPivot+orientation.act([0,2,-5.8])
+    features[3]=Double(0.5-eye.x*fx/eye.z)
+    features[4]=Double(0.5-(eye.y-cameraY)*fy/eye.z)
+    precondition(simd_distance(pivotScene.headGeometry(features).0,fixedPivot)<0.001,
+                 "Nodding must recover a fixed ear-level pivot from projected eye landmarks")
+}
+for side in ["left","right"] {
+    deliver(state("preview",calibrationTarget:[0.2,0.3],previewEye:side))
+    precondition(controller.active && controller.window.isVisible)
+    precondition(controller.calibrationSteps.actionButton.title == "Stop calibration")
+    let activeIndex=side == "left" ? 0 : 1
+    precondition(controller.calibrationSteps.rows[activeIndex].stringValue.contains("Active"))
+    precondition(CalibrationVoiceGuide.instruction(controller.lastState!.onboarding!)!.1.contains(side))
+    if let path=ProcessInfo.processInfo.environment["EYECURSOR_PREVIEW_STEPS_SNAPSHOT"] {
+        let view=controller.calibrationSteps
+        controller.diagnosticWindow.contentView!.layoutSubtreeIfNeeded()
+        let bitmap=view.bitmapImageRepForCachingDisplay(in:view.bounds)!
+        view.cacheDisplay(in:view.bounds,to:bitmap)
+        try! bitmap.representation(using:.png,properties:[:])!.write(to:URL(fileURLWithPath:path+"-"+side+".png"))
+    }
+}
 let heldPreview = AngleDebugger()
 heldPreview.rawDirections.state = .on
 precondition(heldPreview.geometry.childNode(withName: "tracked-head", recursively: true) == nil,
@@ -715,6 +750,30 @@ if let path = ProcessInfo.processInfo.environment["EYECURSOR_MANUAL_SNAPSHOT"] {
     try! bitmap.representation(using:.png,properties:[:])!.write(to:URL(fileURLWithPath:path))
 }
 
+// The eye-circle preparation shows instructions without a fixation target.
+deliver(state("fitting", eyeScan: true))
+precondition(controller.window.isVisible && controller.active)
+precondition(controller.surface.freeEyeInstruction?.contains("12s until the first dot") == true)
+precondition(controller.lastState?.onboarding?.target == nil)
+precondition(controller.calibrationOrbit.sample(at: ProcessInfo.processInfo.systemUptime) == nil)
+precondition(controller.calibrationSteps.rows[0].stringValue.contains("circles"))
+precondition(controller.calibrationSteps.rows[0].stringValue.contains("Active"))
+precondition(controller.calibrationSteps.actionButton.title == "Stop calibration")
+precondition(controller.calibrationSteps.rows.filter { !$0.isHidden }.count == 3)
+if let path = ProcessInfo.processInfo.environment["EYECURSOR_EYE_SWEEP_SNAPSHOT"] {
+    controller.surface.layoutSubtreeIfNeeded()
+    let bitmap = controller.surface.bitmapImageRepForCachingDisplay(in: controller.surface.bounds)!
+    controller.surface.cacheDisplay(in: controller.surface.bounds, to: bitmap)
+    try! bitmap.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: path))
+}
+deliver(state("head", calibrationTarget: [0.5,0.5], eyeScan: true))
+precondition(controller.surface.freeEyeInstruction == nil)
+precondition(controller.window.frame.width == 96)
+precondition(controller.calibrationSteps.rows[0].stringValue.contains("✓"))
+precondition(controller.calibrationSteps.rows[1].stringValue.contains("five dots"))
+precondition(controller.calibrationSteps.rows[1].stringValue.contains("Active"))
+deliver(state("idle"))
+
 precondition(controller.calibrationSteps.rows.filter { !$0.isHidden }.count == 2)
 precondition(controller.calibrationSteps.rows[0].stringValue.hasPrefix("1. Follow five dots"))
 precondition(controller.calibrationSteps.actionButton.isEnabled)
@@ -816,6 +875,78 @@ precondition(!controller.dot.isVisible, "The panel must hide after its fade comp
 precondition(controller.angleDebugger.geometry.childNode(withName:"cursor-projection-ray",recursively:true) == nil)
 precondition(controller.angleDebugger.geometry.childNode(withName:"calibrated-screen-gaze",recursively:true) == nil)
 controller.hideCursor() // Restore the real clock after the deterministic future ticks.
+deliver(state("views", eyeScan:false, twoViews:true))
+precondition(controller.calibrationSteps.rows.filter { !$0.isHidden }.count == 3)
+precondition(controller.calibrationSteps.actionButton.title == "Stop calibration")
+precondition(controller.surface.headCue == "shift" && controller.window.isVisible)
+precondition(!controller.cursorAlignMenu.isEnabled)
+precondition(controller.calibrationSteps.rows[0].stringValue.contains("Follow five dots"))
+let voice = CalibrationVoiceGuide()
+// Both voice controls share one persisted preference; mute also prevents
+// subsequent calibration updates from speaking. Restore the user's setting.
+let savedVoicePreference = UserDefaults.standard.object(forKey: "spokenCalibrationGuidance")
+var uiSpoken: [String] = []
+controller.calibrationVoice.output = { uiSpoken.append($0) }
+controller.setVoiceGuidance(true, persist: false)
+controller.toggleVoiceMute()
+precondition(!controller.calibrationVoice.enabled && controller.voiceGuidance.state == .off)
+precondition(controller.calibrationSteps.muteButton.title == "Unmute")
+precondition(!UserDefaults.standard.bool(forKey: "spokenCalibrationGuidance"))
+controller.calibrationVoice.update(state("head", twoViews:true).onboarding)
+precondition(uiSpoken.isEmpty)
+controller.toggleVoiceMute()
+precondition(controller.calibrationVoice.enabled && controller.voiceGuidance.state == .on)
+precondition(controller.calibrationSteps.muteButton.title == "Mute")
+controller.calibrationVoice.update(state("head", twoViews:true).onboarding)
+precondition(uiSpoken.count == 1)
+controller.voiceGuidance.state = .off
+controller.toggleVoiceGuidance()
+precondition(controller.calibrationSteps.muteButton.title == "Unmute")
+let steps = controller.calibrationSteps
+steps.layoutSubtreeIfNeeded()
+precondition(steps.muteButton.frame.minX >= steps.heading.frame.maxX)
+precondition(!steps.muteButton.isHidden)
+UserDefaults.standard.set(savedVoicePreference, forKey: "spokenCalibrationGuidance")
+controller.setVoiceGuidance(savedVoicePreference as? Bool ?? true, persist:false)
+controller.calibrationVoice.output = { _ in }
+var spoken:[String] = []
+voice.output = { spoken.append($0) }
+voice.update(state("head",twoViews:true).onboarding)
+voice.update(state("head",twoViews:true).onboarding)
+precondition(spoken.count == 1 && spoken[0].contains("head still"))
+voice.update(state("screen",targetIndex:2,twoViews:true).onboarding)
+precondition(spoken.last == "Top left.")
+voice.update(state("views",motionCue:"pitch",twoViews:true).onboarding)
+precondition(spoken.last?.contains("nod") == true)
+voice.enabled = false
+voice.update(state("screen",targetIndex:3,twoViews:true).onboarding)
+precondition(spoken.count == 3)
+voice.enabled = true
+voice.update(state("views_fit",twoViews:true).onboarding)
+precondition(spoken.last?.contains("relax") == false)
+precondition(spoken.last?.contains("continuing") == true)
+deliver(state("views_fit",twoViews:true))
+precondition(controller.active && controller.window.isVisible,
+             "Keep the center target visible while checking recorded head movement")
+precondition(controller.calibrationSteps.actionButton.title == "Stop calibration")
+// A listener on the preferred port must not prevent a standalone launch.
+let occupiedFD = socket(AF_INET, SOCK_STREAM, 0)
+var occupiedAddress = sockaddr_in()
+occupiedAddress.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+occupiedAddress.sin_family = sa_family_t(AF_INET)
+occupiedAddress.sin_addr.s_addr = inet_addr("127.0.0.1")
+let bound = withUnsafePointer(to:&occupiedAddress) { pointer in
+    pointer.withMemoryRebound(to:sockaddr.self,capacity:1) { Darwin.bind(occupiedFD,$0,socklen_t(MemoryLayout<sockaddr_in>.size)) }
+}
+precondition(bound == 0)
+var occupiedSize = socklen_t(MemoryLayout<sockaddr_in>.size)
+_ = withUnsafeMutablePointer(to:&occupiedAddress) { pointer in
+    pointer.withMemoryRebound(to:sockaddr.self,capacity:1) { getsockname(occupiedFD,$0,&occupiedSize) }
+}
+let occupiedPort = UInt16(bigEndian:occupiedAddress.sin_port)
+let fallbackPort = availableTrackerPort(preferred:occupiedPort)
+precondition(fallbackPort > 0 && fallbackPort != Int(occupiedPort))
+close(occupiedFD)
 deliver(state("complete", cursor:true))
 precondition(controller.cursorAlignMenu.title == "Stop learning" && controller.cursorAlignMenu.state == .on)
 precondition(controller.calibrationSteps.actionButton.title == "Stop learning")
@@ -952,7 +1083,22 @@ let measuredHead = guideScene.geometry.childNode(withName:"tracked-head",recursi
 guideScene.rebuild(at:103)
 precondition(guideScene.geometry.childNode(withName:"tracked-head",recursively:true)!.simdPosition == measuredHead,
              "The instructional ghost must never move the measured head")
+if let path = ProcessInfo.processInfo.environment["EYECURSOR_HEAD_ICONS_SNAPSHOT"] {
+    let sheet = NSView(frame:NSRect(x:0,y:0,width:384,height:140))
+    for (index,cue) in ["shift","depth","pitch","yaw"].enumerated() {
+        let icon = CalibrationView(frame:NSRect(x:96*index,y:0,width:96,height:140))
+        icon.headCue=cue; icon.progress=0.65; icon.accepted=true
+        sheet.addSubview(icon)
+    }
+    let bitmap=sheet.bitmapImageRepForCachingDisplay(in:sheet.bounds)!
+    sheet.cacheDisplay(in:sheet.bounds,to:bitmap)
+    try! bitmap.representation(using:.png,properties:[:])!.write(to:URL(fileURLWithPath:path))
+}
 if let path = ProcessInfo.processInfo.environment["EYECURSOR_MOTION_GUIDE_SNAPSHOT"] {
+    let targetView = controller.surface
+    let targetBitmap = targetView.bitmapImageRepForCachingDisplay(in:targetView.bounds)!
+    targetView.cacheDisplay(in:targetView.bounds,to:targetBitmap)
+    try! targetBitmap.representation(using:.png,properties:[:])!.write(to:URL(fileURLWithPath:path+"-target.png"))
     guideScene.sceneView.frame = NSRect(x:0,y:0,width:900,height:650)
     guideScene.camera.simdPosition = [65,48,115]; guideScene.camera.look(at:SCNVector3(6,6,12))
     guideScene.sceneView.isPlaying = false
@@ -999,8 +1145,8 @@ if let path = ProcessInfo.processInfo.environment["EYECURSOR_WORKFLOW_SNAPSHOT"]
     try! bitmap.representation(using:.png,properties:[:])!.write(to:URL(fileURLWithPath:path))
 }
 let physicalOrigin = controller.angleDebugger.referenceEyeOrigin(neutralHead)
-precondition(abs(physicalOrigin.z-controller.angleDebugger.value("distance"))<0.001,
-             "A gaze fit must not change the independent illustration distance")
+precondition(abs(physicalOrigin.z-(controller.angleDebugger.value("distance")-5.8))<0.001,
+             "A gaze fit must not change head distance; neutral eyes sit 5.8 cm in front of its center")
 controller.timer?.invalidate(); controller.animationTimer?.invalidate(); controller.diagnosticTimer?.invalidate()
 let evidence = AngleDebugger()
 evidence.update(state("complete", irEye:true, rawGaze:[1.4,-0.2], references:true),at:200)
@@ -1246,5 +1392,57 @@ precondition(markers.childNodes.filter { $0.name?.hasPrefix("accuracy-pending-")
 deliver(state("complete")); scene.rebuild()
 precondition(scene.geometry.childNode(withName:"accuracy-check-markers",recursively:false) == nil,
              "An unchecked mapping must not retain old check markers")
+if let path=ProcessInfo.processInfo.environment["EYECURSOR_RECORDING_SNAPSHOT"] {
+    controller.angleDebugger.refreshDisplays()
+    controller.recording.initialized=true
+    controller.recording.loadTimeline("20261027T120000-1234abcd",show:false)
+    func awaitReplay(_ condition:()->Bool) {
+        let deadline=Date(timeIntervalSinceNow:10)
+        while !condition() && Date()<deadline { RunLoop.current.run(until:Date(timeIntervalSinceNow:0.02)) }
+        precondition(condition(),"Integrated replay did not reach the requested frame")
+    }
+    awaitReplay { controller.recording.timeline != nil }
+    precondition(!controller.replaying,"Finishing a recording must leave cameras live until Play or seek")
+    controller.recording.togglePlay()
+    awaitReplay { controller.replaying && controller.preview.image != nil }
+    controller.recording.seek(500)
+    awaitReplay { controller.diagnosticRate.stringValue.contains("00:00.500") }
+    precondition(controller.secondaryEyePreview.image != nil && controller.facePreview.image != nil)
+    precondition(controller.eyeDots["left"]!.isVisible && controller.eyeDots["right"]!.isVisible && controller.dot.isVisible)
+    precondition(abs(controller.dot.frame.midX-550)<0.01,"Replay must use the saved white cursor, not the state's prediction")
+    let pinnedFrame=controller.recording.view.convert(controller.recording.view.bounds,to:controller.diagnosticWindow.contentView)
+    precondition(pinnedFrame.minY >= 0 && pinnedFrame.minY < 2,"Recording controls must stay at the sidebar bottom")
+    precondition(controller.recording.view.superview === controller.diagnosticWindow.contentView)
+    let before=controller.dot.frame
+    let live=controller.lastState!
+    controller.render(live);controller.animateCursor(at:999);controller.animateMeasurements();controller.refreshDiagnosticFrame()
+    precondition(controller.dot.frame == before,"Live polling must not overwrite paused replay")
+    precondition(!controller.calibrateMenu.isEnabled && !controller.blinkMenu.isEnabled)
+    for name in ["calibrated-eye-ray-left","calibrated-eye-ray-right","calibrated-screen-gaze"] {
+        precondition(controller.angleDebugger.geometry.childNode(withName:name,recursively:true) != nil,"Replay scene must show saved node \(name)")
+    }
+    let references=controller.angleDebugger.savedReferences.count
+    controller.recording.step(1)
+    awaitReplay { controller.diagnosticRate.stringValue.contains("00:00.533") }
+    controller.recording.step(-1)
+    awaitReplay { controller.diagnosticRate.stringValue.contains("00:00.500") }
+    precondition(controller.angleDebugger.savedReferences.count == references,"Seeking must not accumulate calibration samples")
+    controller.recording.togglePlay();precondition(controller.recording.playing)
+    RunLoop.current.run(until:Date(timeIntervalSinceNow:0.15))
+    controller.recording.togglePlay();precondition(!controller.recording.playing)
+    controller.recording.seek(500)
+    awaitReplay { controller.diagnosticRate.stringValue.contains("00:00.500") }
+    controller.diagnosticWindow.contentView!.layoutSubtreeIfNeeded()
+    let view=controller.diagnosticWindow.contentView!
+    let bitmap=view.bitmapImageRepForCachingDisplay(in:view.bounds)!
+    view.cacheDisplay(in:view.bounds,to:bitmap)
+    try! bitmap.representation(using:.png,properties:[:])!.write(to:URL(fileURLWithPath:path))
+    let scenePicture=controller.angleDebugger.sceneView.snapshot()
+    let sceneBitmap=NSBitmapImageRep(data:scenePicture.tiffRepresentation!)!
+    try! sceneBitmap.representation(using:.png,properties:[:])!.write(to:URL(fileURLWithPath:path+"-scene.png"))
+    controller.recording.stopAction()
+    precondition(!controller.replaying && controller.angleDebugger.replayTime == nil)
+    precondition(controller.recording.timeline != nil,"Stop must retain the latest clip for another replay")
+}
 controller.window.orderOut(nil);controller.dot.orderOut(nil)
 print("Native lifecycle passed: no timeout cancellation, completion shows cursor, stale fading and recovery, missing gaze opacity and expiry.")

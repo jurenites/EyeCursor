@@ -32,6 +32,7 @@ from screen_gaze import ScreenGazeMotion
 from onboarding import Onboarding
 from head_camera import HeadCamera, MODEL_PATH
 from dual_head_camera import DualHeadCamera
+from diagnostic_snapshot import compact_state
 from hybrid_onboarding import HybridOnboarding
 from app_version import versioned_build
 
@@ -126,16 +127,20 @@ def render_diagnostic_frame(frame, result, eye_region=None, threshold=MIN_CONFID
     result = (result or {}).get("display_hold") or display_result or result
     image = tracker.crop_to_aspect_ratio(frame).copy()
     height, width = image.shape[:2]
-    accepted = usable(result, threshold) if display_accepted is None else display_accepted
+    accepted = bool(result and result.get('pupil_ellipse') and result.get('confidence',0)>=threshold) if display_accepted is None else display_accepted
     if eye_region:
         x0, y0, x1, y1 = eye_region
         cv2.rectangle(image, (round(x0 * width), round(y0 * height)),
                       (round(x1 * width), round(y1 * height)), (255, 210, 0), 2)
     if result:
+        if result.get("eye_model_estimated") and result.get("eye_center"):
+            radius=round(result.get("sphere_radius",0))
+            if 0<radius<max(width,height)*2:
+                cv2.circle(image,tuple(round(v) for v in result['eye_center']),radius,(255,230,60),1)
         iris = result.get("iris_ellipse")
         if iris and iris.get("center") and iris.get("axes"):
             cv2.ellipse(image, (tuple(iris["center"]), tuple(iris["axes"]), iris["angle_degrees"]),
-                        (200, 175, 80), 1)
+                        (230, 230, 230), 1)
         ellipse = result.get("pupil_ellipse")
         if ellipse and ellipse.get("center") and ellipse.get("axes"):
             center = tuple(round(value) for value in ellipse["center"])
@@ -144,10 +149,6 @@ def render_diagnostic_frame(frame, result, eye_region=None, threshold=MIN_CONFID
             cv2.circle(image, center, 4, (40, 220, 40) if accepted else (40, 70, 255), -1)
             if eye_model_ready and accepted and result.get("eye_center") and result.get("eye_model_estimated", False):
                 eye_center = tuple(result["eye_center"])
-                cv2.circle(image, eye_center, 5, (255, 230, 60), -1)
-                radius = round(result.get("sphere_radius", 0))
-                if 0 < radius < max(width, height) * 2:
-                    cv2.circle(image, eye_center, radius, (255, 230, 60), 1)
                 dx, dy = center[0] - eye_center[0], center[1] - eye_center[1]
                 length = math.hypot(dx, dy)
                 if length > 2:
@@ -669,6 +670,7 @@ class Calibration:
                 cursor_message='Waiting for synchronized eye samples'
             return {
                 "raw_eye_predictions":raw_eyes,
+                "recording_displays": self.onboarding.displays if self.onboarding else [],
                 "tracking_viewport": self.onboarding.displays[0]["viewport"] if self.onboarding and self.onboarding.displays else None,
                 "gaze_capture_time": (result or {}).get("capture_time"),
                 "binocular_status":binocular['status'],
@@ -813,7 +815,7 @@ def make_handler(calibration):
                 self.end_headers()
                 self.wfile.write(page)
             elif self.path == "/state":
-                self.respond(200, calibration.state())
+                self.respond(200, compact_state(calibration.state()))
             elif self.path in ("/diagnostics/left.jpg", "/diagnostics/right.jpg"):
                 eye = self.path.rsplit("/", 1)[1].split(".")[0]
                 jpeg = calibration.eye_cameras.jpeg(eye) if calibration.eye_cameras else None
@@ -872,20 +874,37 @@ def make_handler(calibration):
                 self.respond(404, {"error": "Not found"})
 
         def do_POST(self):
-            if self.path not in ("/recordings/open", "/capture", "/reset", "/calibration/start", "/blink-click", "/eye-region", "/eye-cameras", "/head-camera", "/eye-sphere", "/gaze-eyes",
+            if self.path not in ("/diagnostics/record-start", "/diagnostics/record-stop", "/diagnostics/record-pause", "/recordings/open", "/capture", "/reset", "/calibration/start", "/blink-click", "/eye-region", "/eye-cameras", "/head-camera", "/eye-sphere", "/gaze-eyes",
                                  "/eye-model/start", "/eye-model/freeze", "/onboarding/displays",
                                  "/onboarding/start", "/onboarding/retry", "/onboarding/stop", "/onboarding/cancel", "/detection-threshold",
-                                 "/onboarding/cursor-start", "/onboarding/cursor-sample", "/onboarding/cursor-finish", "/onboarding/head-refine", "/onboarding/head-retry", "/onboarding/preview-start", "/onboarding/accuracy-start", "/onboarding/learn-dots"):
+                                 "/onboarding/cursor-start", "/onboarding/cursor-sample", "/onboarding/cursor-finish", "/onboarding/head-refine", "/onboarding/head-retry", "/onboarding/preview-start", "/onboarding/preview-target", "/onboarding/accuracy-start", "/onboarding/learn-dots"):
                 self.respond(404, {"error": "Not found"})
                 return
             try:
+                if self.path.startswith('/diagnostics/record-'):
+                    if self.headers.get('Content-Type','').split(';',1)[0]!='application/json':
+                        raise ValueError('Expected application/json')
+                    origin=self.headers.get('Origin')
+                    if origin and origin not in ('http://127.0.0.1:8766',f'http://127.0.0.1:{self.server.server_port}'):
+                        raise ValueError('Use the local recorder page')
                 size = int(self.headers.get("Content-Length", "0"))
                 if size > 1024:
                     raise ValueError("Request too large")
                 body = json.loads(self.rfile.read(size) or b"{}")
                 if not isinstance(body, dict):
                     raise ValueError("Expected a JSON object")
-                if self.path == "/recordings/open":
+                if self.path == "/diagnostics/record-start":
+                    from diagnostic_recording import begin
+                    begin(body.get('session_id',''),float(body.get('origin_monotonic', 'nan')))
+                    result = {"recording":True}
+                elif self.path == "/diagnostics/record-pause":
+                    from diagnostic_recording import pause
+                    pause(body.get('session_id',''),bool(body.get('paused')),float(body.get('at',0)))
+                    result = {"paused":bool(body.get('paused'))}
+                elif self.path == "/diagnostics/record-stop":
+                    from diagnostic_recording import finish
+                    result = finish(body.get('session_id',''))
+                elif self.path == "/recordings/open":
                     from session_recorder import open_service
                     open_service(self.server.server_port)
                     result = {"opened":True}
@@ -896,7 +915,7 @@ def make_handler(calibration):
                         if self.path == "/onboarding/displays":
                             calibration.onboarding.configure(body.get("displays"))
                         elif self.path == "/onboarding/start":
-                            if getattr(calibration.onboarding,'hybrid',False):calibration.onboarding.arm(start=True)
+                            if getattr(calibration.onboarding,'hybrid',False):calibration.onboarding.arm(start=True,preview_alignment=body.get('preview_alignment',False))
                             else:calibration.onboarding.arm()
                         elif self.path == "/onboarding/stop":
                             if getattr(calibration.onboarding, 'hybrid', False):
@@ -906,6 +925,8 @@ def make_handler(calibration):
                             if not getattr(calibration.onboarding, 'hybrid', False):
                                 raise ValueError('Step retry is available for IR + webcam calibration')
                             calibration.onboarding.retry_step()
+                        elif self.path == '/onboarding/preview-target':
+                            calibration.onboarding.set_preview_target(body.get('eye'),body.get('target'))
                         elif self.path == '/onboarding/preview-start':
                             if not getattr(calibration.onboarding,'hybrid',False):
                                 raise ValueError('Preview alignment requires IR + webcam tracking')
@@ -1247,7 +1268,8 @@ def main():
                     tracker.pupil_confidence_threshold = calibration.detection_threshold
                     tracker.pupil_confidence_threshold_sphere = calibration.detection_threshold
                     if eye_rig:
-                        eye_rig.apply_eye_sphere_setting(eye_rig.frame_context[0], tracker, calibration.eye_model)
+                        eye_rig.apply_eye_sphere_setting(eye_rig.frame_context[0], tracker, calibration.eye_model,
+                            force_collecting=getattr(calibration.onboarding,'hybrid',False) and calibration.onboarding.phase=='fitting')
                     else:
                         tracker.eye_sphere_adjustment_enabled = calibration.eye_model.phase == "collecting"
                 tracker.process_frame(frame, timestamp=(tracker.video_frame_timestamp(capture)
@@ -1292,6 +1314,8 @@ def main():
         if companion:
             companion.close()
         capture.release()
+        if calibration.onboarding and hasattr(calibration.onboarding,"close"):
+            calibration.onboarding.close()
         if calibration.head_camera:
             calibration.head_camera.close()
         if server:

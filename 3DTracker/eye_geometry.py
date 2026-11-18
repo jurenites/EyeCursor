@@ -79,6 +79,78 @@ def fit_eye_center(ellipses, shape):
             'residual_px': float(np.median(residual))}
 
 
+def fit_eye_sphere(ellipses, shape, irises=None):
+    """Joint image-space center/scale under an orthographic circular-pupil model.
+
+    q=b/a=cos(theta), d=L*sin(theta), R²=L²+iris_radius². R is the
+    projected sphere radius and L is the center-to-pupil-plane distance.
+    This is a camera projection estimate, not a measured anatomical radius.
+    Never infer scale from the largest pupil excursion or force two cameras to
+    share pixels. Inconsistent foreshortening and enclosing-iris evidence reject
+    the fit rather than inflating the drawing.
+    """
+    center_fit=fit_eye_center(ellipses,shape)
+    if center_fit is None:return None
+    center=np.asarray(center_fit['center'])
+    rows=[]
+    for index,ellipse in enumerate(ellipses):
+        normal=ellipse_normal(ellipse)
+        if normal is None:continue
+        point=np.asarray(ellipse[0]);axes=np.asarray(ellipse[1])
+        q=min(axes)/max(axes);sine=math.sqrt(1-q*q)
+        delta=point-center
+        if abs(normal[0][0]*delta[1]-normal[0][1]*delta[0])>5:continue
+        distance=float(np.linalg.norm(delta))
+        if distance<8:continue
+        radius=distance/sine
+        rows.append((index,radius))
+    if len(rows)<12:return None
+    values=np.asarray(rows);radius=float(np.median(values[:,1]))
+    if not np.isfinite(radius) or not 8<radius<2*max(shape[:2]):return None
+    residual=np.abs(values[:,1]-radius)/radius
+    keep=residual<=.12
+    if keep.sum()<12 or keep.mean()<.7:return None
+    rotation_radius=float(np.median(values[keep,1]))
+    iris_radii=[max(irises[int(row[0])][1])/2 for row in values[keep]
+                if irises is not None and int(row[0])<len(irises) and irises[int(row[0])] is not None]
+    # The iris rim, not the pupil edge, estimates the enclosing sphere. When
+    # iris evidence is absent only the rotation scale is available: do not draw
+    # the smaller pupil-rim sphere as the anatomical eyeball.
+    if len(iris_radii)<6:return None
+    rim=float(np.median(iris_radii))
+    radius=math.hypot(rotation_radius,rim)
+    # A fitted eyeball outline must enclose reliable iris boundaries. Use many
+    # frames so a single clipped iris cannot invalidate otherwise good geometry.
+    enclosing=[]
+    if irises is not None:
+        for row in values[keep]:
+            if int(row[0])>=len(irises):continue
+            iris=irises[int(row[0])]
+            if iris is None:continue
+            (x,y),(a,b),angle=iris
+            theta=math.radians(angle);t=np.linspace(0,2*math.pi,48,endpoint=False)
+            xy=np.column_stack((a/2*np.cos(t),b/2*np.sin(t)))
+            rotation=np.array([[math.cos(theta),-math.sin(theta)],[math.sin(theta),math.cos(theta)]])
+            boundary=xy@rotation.T+[x,y]
+            enclosing.append(np.max(np.linalg.norm(boundary-center,axis=1))<=radius+2)
+        if len(enclosing)>=6 and np.mean(enclosing)<.8:return None
+    return dict(center_fit,radius_px=radius,radius_samples=int(keep.sum()),
+                rotation_radius_px=rotation_radius,iris_radius_px=rim,
+                radius_spread=float(np.median(residual)),
+                iris_checks=len(enclosing),method='orthographic-pupil-sphere-v1')
+
+
+def sphere_direction(pupil, center, rotation_radius):
+    """Camera-view unit direction: +X right, +Y up, +Z toward the camera."""
+    if pupil is None or rotation_radius is None:return None
+    point,axes,_=pupil
+    if not np.isfinite([*point,*axes,*center,rotation_radius]).all() or min(axes)<=0:return None
+    if rotation_radius<=0:return None
+    xy=(np.asarray(point)-np.asarray(center))/rotation_radius
+    if float(xy@xy)>=1:return None
+    return [float(xy[0]),float(-xy[1]),math.sqrt(1-float(xy@xy))]
+
+
 def trace_iris(gray, pupil):
     """Trace outward dark-to-light edges around a pupil, excluding eyelid poles.
 

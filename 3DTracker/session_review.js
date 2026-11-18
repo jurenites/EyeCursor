@@ -11,7 +11,7 @@ const post = (path,body) => api(path,{method:'POST',headers:{'Content-Type':'app
 function notice(text) { $('message').textContent=text; }
 function showStatus(status) {
   active=status.active; $('start').disabled=!!active; $('stop').disabled=!active;
-  if (active) notice('Recording. Stop to save the video; keep EyeCursor open.');
+  if (active) notice(`Recording · ${Math.floor(status.elapsed_seconds||0)} / 60 seconds. Stop to save early.`);
 }
 async function refreshDisplays() {
   const [list,config]=await Promise.all([api('/api/displays'),api('/api/config')]);
@@ -27,9 +27,11 @@ async function refreshSessions() {
   $('sessions').replaceChildren(...list.map(item=>{
     const button=document.createElement('button'); button.className=`session ${selected===item.id?'active':''}`;
     button.textContent=new Date(item.created_at).toLocaleString();
-    const detail=document.createElement('span'); detail.textContent=`${item.status} · display ${item.display.id}`;
+    const detail=document.createElement('span'); detail.textContent=`${item.status} · ${item.display?'display '+item.display.id:'cameras only'}`;
+    button.disabled=item.status==='recording';
     button.append(detail); button.onclick=()=>loadSession(item.id).catch(e=>notice(e.message)); return button;
   }));
+  return list;
 }
 async function loadSession(id) {
   const token=++requestID;
@@ -39,12 +41,13 @@ async function loadSession(id) {
   try { areas=JSON.parse(localStorage.getItem(`gaze-areas:${id}`)||'[]'); } catch {}
   if(!Array.isArray(areas)) areas=[];
   areas=areas.filter(a=>[a.x0,a.x1,a.y0,a.y1].every(Number.isFinite));
-  $('title').textContent=`Session ${new Date(data.manifest.created_at).toLocaleString()}`;
-  $('video').src=`/api/sessions/${id}/video`;
+  $('title').textContent='Latest recording';
+  setupDiagnosticReplay();
   $('tracking').href=`/api/sessions/${id}/tracking`; $('tracking').hidden=false;
   $('from').value=0;
   $('to').value=((data.manifest.duration_ms || data.gaze.at(-1)?.t_ms || 0)/1000).toFixed(3);
-  await review(); refreshSessions();
+  if(data.manifest.display) await review(); else { $('stats').replaceChildren();notice('Camera replay ready. Select a time to inspect the exact captured measurements.'); }
+  refreshSessions();
 }
 function span(text) { const node=document.createElement('span'); node.textContent=text; return node; }
 async function review() {
@@ -69,7 +72,7 @@ async function review() {
   finally { if(token===requestID) $('review').disabled=false; }
 }
 function lowerBound(items,t,key='t_ms') {
-  let lo=0,hi=items.length; while(lo<hi) { const m=(lo+hi)>>1; if(items[m][key]<t) lo=m+1; else hi=m; } return lo;
+  let lo=0,hi=items.length; while(lo<hi) { const m=(lo+hi)>>1; if((typeof items[m]==='number'?items[m]:items[m][key])<t) lo=m+1; else hi=m; } return lo;
 }
 function nearest(items,t) {
   if(!items?.length) return null;
@@ -105,7 +108,7 @@ function draw() {
   if(canvas.width!==w||canvas.height!==h) {canvas.width=w;canvas.height=h;}
   const ctx=canvas.getContext('2d'); ctx.clearRect(0,0,w,h);
   if(!data || !analysis) return;
-  const ms=video.currentTime*1000, scale=w/1280;
+  const ms=replayTime(), scale=w/1280;
   if($('heatmap').checked) ctx.drawImage(buildHeat(w,h),0,0,w,h);
   // A short replay trail, not fabricated positions between camera observations.
   const points=analysis.points, from=lowerBound(points,ms-1500),end=lowerBound(points,ms+.001);
@@ -162,7 +165,7 @@ function renderAreas() {
   }));
 }
 function selectionPoint(e) { const r=$('overlay').getBoundingClientRect();return [Math.max(0,Math.min(1,(e.clientX-r.left)/r.width)),Math.max(0,Math.min(1,(e.clientY-r.top)/r.height))]; }
-$('addArea').onclick=()=>{if(!analysis)return;selecting=!selecting;$('video').pause();$('screen').classList.toggle('selecting',selecting);notice(selecting?'Drag a box around a screen area. Keep the review range within a stable scene.':'Area selection cancelled.');};
+$('addArea').onclick=()=>{if(!analysis)return;selecting=!selecting;pauseReplay();$('screen').classList.toggle('selecting',selecting);notice(selecting?'Drag a box around a screen area. Keep the review range within a stable scene.':'Area selection cancelled.');};
 $('overlay').onpointerdown=e=>{if(!selecting)return;const [x,y]=selectionPoint(e);drawing={x0:x,y0:y,x1:x,y1:y};$('overlay').setPointerCapture(e.pointerId);};
 $('overlay').onpointermove=e=>{if(!drawing)return;[drawing.x1,drawing.y1]=selectionPoint(e);draw();};
 $('overlay').onpointerup=e=>{
@@ -181,13 +184,16 @@ $('export').onclick=()=>{
   const url=URL.createObjectURL(new Blob([JSON.stringify(report,null,2)],{type:'application/json'}));
   const a=document.createElement('a');a.href=url;a.download=`${selected}-review.json`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
 };
-$('start').onclick=async()=>{notice('Starting screen capture…');$('start').disabled=true;try {const s=await post('/api/start',{display_id:Number($('display').value)});showStatus({active:s.id});await refreshSessions();}catch(e){notice(e.message);$('start').disabled=false;}};
+$('start').onclick=async()=>{pauseReplay();notice('Starting diagnostic recording…');$('start').disabled=true;try {const s=await post('/api/start',{display_id:$('includeScreen').checked?Number($('display').value):0});showStatus({active:s.id});requestID++;selected=null;data=null;analysis=null;
+$('diagnosticReplay').hidden=true;$('screen').hidden=true;$('gazeReview').hidden=true;
+$('video').removeAttribute('src');$('video').load();$('tracking').hidden=true;
+['play','previousFrame','nextFrame','seekTime','timeline'].forEach(id=>$(id).disabled=true);
+$('title').textContent='Recording…';$('playTime').textContent='00:00.000';$('timeline').value=0;
+await refreshSessions();if(s.retention_warning)notice(s.retention_warning);}catch(e){notice(e.message);$('start').disabled=false;}};
 $('stop').onclick=async()=>{notice('Saving recording…');$('stop').disabled=true;try{const s=await post('/api/stop',{});showStatus({active:null});await refreshSessions();await loadSession(s.id);if(s.error)notice(s.error);}catch(e){notice(e.message);$('stop').disabled=false;}};
 $('review').onclick=review;
-$('markIn').onclick=()=>{$('from').value=$('video').currentTime.toFixed(3);};
-$('markOut').onclick=()=>{$('to').value=$('video').currentTime.toFixed(3);};
+$('markIn').onclick=()=>{$('from').value=(replayTime()/1000).toFixed(3);};
+$('markOut').onclick=()=>{$('to').value=(replayTime()/1000).toFixed(3);};
 ['trail','heatmap','raw','cursor','gaze','radius'].forEach(id=>$(id).addEventListener('change',draw));
 ['timeupdate','seeked','loadedmetadata'].forEach(event=>$('video').addEventListener(event,draw));
 if($('video').requestVideoFrameCallback) { const frame=()=>{draw();$('video').requestVideoFrameCallback(frame);};$('video').requestVideoFrameCallback(frame); }
-Promise.all([refreshDisplays(),refreshSessions(),api('/api/status').then(showStatus)]).catch(e=>notice(e.message));
-setInterval(()=>{if(active)refreshSessions().catch(()=>{});},4000);
